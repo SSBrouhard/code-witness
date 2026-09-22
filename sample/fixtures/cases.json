@@ -1,0 +1,12 @@
+[
+  {"name":"round-half-up", "input":{"balance":"10.00", "operations":[{"kind":"credit","amount":"1.005"},{"kind":"debit","amount":"0.005"}]}},
+  {"name":"overdraft-blocked", "input":{"balance":"1.00", "operations":[{"kind":"debit","amount":"2.00"}]}},
+  {"name":"overdraft-enabled", "input":{"balance":"1.00", "overdraft_enabled":true, "operations":[{"kind":"debit","amount":"2.00"}]}},
+  {"name":"zero", "input":{"balance":"0", "operations":[{"kind":"credit","amount":"0"},{"kind":"debit","amount":"0"}]}},
+  {"name":"negative-attempt", "input":{"balance":"10.00", "operations":[{"kind":"credit","amount":"-2"},{"kind":"debit","amount":"-0.001"}]}},
+  {"name":"retry-recovers", "input":{"balance":"2.00", "transient_failures":1, "operations":[{"kind":"debit","amount":"1"}]}},
+  {"name":"retry-exhausted", "input":{"balance":"2.00", "transient_failures":3, "operations":[]}},
+  {"name":"empty-batch", "input":{"balance":"0", "operations":[]}},
+  {"name":"event-order", "input":{"balance":"1", "operations":[{"kind":"credit","amount":"2.225"},{"kind":"debit","amount":"3.23"},{"kind":"debit","amount":"1"}]}},
+  {"name":"unknown-operation", "input":{"balance":"1", "operations":[{"kind":"transfer","amount":"1"}]}}
+]

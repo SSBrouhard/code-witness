@@ -1,0 +1,14 @@
+Unmodified upstream module, copied from an existing local checkout (no network fetch).
+Origin: https://github.com/eugeniughelbur/obsidian-second-brain/blob/1306c7a54b407adb58c3f96f117b4b941e3f141e/scripts/research/lib/http.py
+Repository: https://github.com/eugeniughelbur/obsidian-second-brain
+Commit: 1306c7a54b407adb58c3f96f117b4b941e3f141e
+Original path: scripts/research/lib/http.py
+License: MIT, Copyright (c) 2026 Eugeniu Ghelbur; full notice in LICENSE.
+SHA-256: d5f9364234c824c2d09b3a162bc471bca363bcd7a0904fe1269a2dd00146be5c
+Verified byte-for-byte against the local checkout and Git blob at this commit.
+
+Selection: the Python repositories found under ~/Documents were third-party
+checkouts; no user-owned upstream repository was verified. ~/src and ~/code
+were absent. This is the requested foreign-module fallback, not a new sample.
+The module is analyzed statically only. Its requests/urllib3 dependencies are
+not installed or imported by debt-compiler.

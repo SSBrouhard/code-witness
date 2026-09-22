@@ -1,0 +1,17 @@
+{
+  "format_version": 1,
+  "tool_version": "0.1.0",
+  "extract_time": "2026-09-19T07:34:42.135202+00:00",
+  "default_source_root": "../..",
+  "source_roots": [
+    {
+      "path": ".",
+      "git_head": null
+    }
+  ],
+  "source_files": [
+    "fixtures/foreign/http.py"
+  ],
+  "exit_classification": "runtime-skipped",
+  "exit_code": 0
+}

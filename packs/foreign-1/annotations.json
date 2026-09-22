@@ -1,0 +1,106 @@
+[
+  {
+    "file": "fixtures/foreign/http.py",
+    "line": 13,
+    "location": "fixtures/foreign/http.py:13",
+    "tag": "retry",
+    "risk": "do-not-touch",
+    "snippet": "retry",
+    "reason": "Retry workaround may encode an external-system contract. Preserve until proven otherwise; attach Git context when present.",
+    "git": {
+      "status": "unavailable",
+      "reason": "File is untracked or has no blame history"
+    }
+  },
+  {
+    "file": "fixtures/foreign/http.py",
+    "line": 23,
+    "location": "fixtures/foreign/http.py:23",
+    "tag": "magic-number",
+    "risk": "needs-human",
+    "snippet": "15",
+    "reason": "Unexplained numeric constant may encode a business or timing rule.",
+    "git": {
+      "status": "unavailable",
+      "reason": "File is untracked or has no blame history"
+    }
+  },
+  {
+    "file": "fixtures/foreign/http.py",
+    "line": 34,
+    "location": "fixtures/foreign/http.py:34",
+    "tag": "retry",
+    "risk": "do-not-touch",
+    "snippet": "retries",
+    "reason": "Retry workaround may encode an external-system contract. Preserve until proven otherwise; attach Git context when present.",
+    "git": {
+      "status": "unavailable",
+      "reason": "File is untracked or has no blame history"
+    }
+  },
+  {
+    "file": "fixtures/foreign/http.py",
+    "line": 34,
+    "location": "fixtures/foreign/http.py:34",
+    "tag": "magic-number",
+    "risk": "needs-human",
+    "snippet": "3",
+    "reason": "Unexplained numeric constant may encode a business or timing rule.",
+    "git": {
+      "status": "unavailable",
+      "reason": "File is untracked or has no blame history"
+    }
+  },
+  {
+    "file": "fixtures/foreign/http.py",
+    "line": 40,
+    "location": "fixtures/foreign/http.py:40",
+    "tag": "retry",
+    "risk": "do-not-touch",
+    "snippet": "retry",
+    "reason": "Retry workaround may encode an external-system contract. Preserve until proven otherwise; attach Git context when present.",
+    "git": {
+      "status": "unavailable",
+      "reason": "File is untracked or has no blame history"
+    }
+  },
+  {
+    "file": "fixtures/foreign/http.py",
+    "line": 41,
+    "location": "fixtures/foreign/http.py:41",
+    "tag": "retry",
+    "risk": "do-not-touch",
+    "snippet": "retries",
+    "reason": "Retry workaround may encode an external-system contract. Preserve until proven otherwise; attach Git context when present.",
+    "git": {
+      "status": "unavailable",
+      "reason": "File is untracked or has no blame history"
+    }
+  },
+  {
+    "file": "fixtures/foreign/http.py",
+    "line": 43,
+    "location": "fixtures/foreign/http.py:43",
+    "tag": "magic-number",
+    "risk": "needs-human",
+    "snippet": "500",
+    "reason": "Unexplained numeric constant may encode a business or timing rule.",
+    "git": {
+      "status": "unavailable",
+      "reason": "File is untracked or has no blame history"
+    }
+  },
+  {
+    "file": "fixtures/foreign/http.py",
+    "line": 47,
+    "location": "fixtures/foreign/http.py:47",
+    "tag": "retry",
+    "risk": "do-not-touch",
+    "snippet": "max_retries",
+    "reason": "Retry workaround may encode an external-system contract. Preserve until proven otherwise; attach Git context when present.",
+    "git": {
+      "status": "unavailable",
+      "reason": "File is untracked or has no blame history"
+    }
+  }
+]
