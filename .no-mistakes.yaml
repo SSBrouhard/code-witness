@@ -1,0 +1,3 @@
+# Positive declaration that this repository has no CI.
+# Read only from the default branch.
+no_ci: true
