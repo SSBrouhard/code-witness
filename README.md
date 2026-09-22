@@ -1,6 +1,10 @@
-# debt-compiler
+# code-witness
 
-A local Python slice compiler: tree-sitter graph, Git archaeology, contract candidates, and executable characterization. The deterministic extractor has no LLM, API key, cloud service, or rewrite engine. An optional Jev evidence review is separate and requires its own API key.
+This repository is code-witness. The command is `debt-compiler`.
+
+`debt-compiler` is a local Python slice compiler: tree-sitter graph, Git archaeology, contract candidates, and executable characterization. The deterministic extractor has no LLM, API key, cloud service, or rewrite engine. An optional Jev evidence review is separate and requires its own API key.
+
+The license is MIT. Copyright (c) 2026 Stephen Brouhard. The full text is in [LICENSE](LICENSE).
 
 ## Run
 
@@ -114,3 +118,7 @@ ten, then fails on `2.675`. The shipped sample stays at ten MATCH cases.
 `DiffClassifier` in `harness.py` is only a protocol for `noise | semantic_break | invariant_violation`. No classifier or paid API is called. Joern and optional LLM drafting are deferred.
 
 Parser API reference: [py-tree-sitter](https://github.com/tree-sitter/py-tree-sitter).
+
+## License
+
+The license is MIT. See [LICENSE](LICENSE).
