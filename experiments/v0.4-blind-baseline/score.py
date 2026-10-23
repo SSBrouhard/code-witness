@@ -10,6 +10,7 @@ import json
 import os
 from pathlib import Path
 import random
+import re
 import shutil
 import subprocess
 import sys
@@ -25,6 +26,11 @@ from debt_compiler.manifest import resolve_source_root
 
 COSMIC = str(Path(sys.executable).with_name("cosmic-ray"))
 KNOCKOUT = 'raise RuntimeError("code-witness knockout")'
+KNOCKOUT_THRESHOLD = 0.8
+# pytest --tb=long ends each failure with "path:line: ExceptionType".
+FAILURE_ORIGIN = re.compile(r"^(?P<path>.+?):(?P<line>\d+): (?P<type>[A-Za-z_][\w.]*)$")
+ASSERTION_TYPES = {"AssertionError", "Failed"}  # Failed: pytest.raises/fail outcomes such as DID NOT RAISE
+DEPENDENCY_TYPES = {"ImportError", "ModuleNotFoundError"}
 
 
 def git(tree, *args):
@@ -47,6 +53,8 @@ def require_clean(tree):
 
 def restore(tree):
     git(tree, "checkout", "--", ".")
+    # Removes files a patch added; _witness/ is excluded, so git clean (without -x) leaves it alone.
+    git(tree, "clean", "-fdq")
     require_clean(tree)
 
 
@@ -54,15 +62,46 @@ def digest(text):
     return hashlib.sha256(text.encode()).hexdigest()
 
 
-def classify(behavioral, timeouts, errors):
-    """Only an observed behavioral difference counts as a kill."""
+def classify(behavioral, timeouts, errors, unclassified=()):
+    """Only an observed behavioral difference counts as a kill; uncertain failures go to adjudication."""
     if behavioral:
         return "behavioral"
+    if unclassified:
+        return "adjudicate"
     if timeouts:
         return "timeout"
     if errors:
         return "error"
     return "survived"
+
+
+def classify_failure(text, scope):
+    """Classify one pytest junit <failure> by its exception type and where it was raised."""
+    lines = (text or "").strip().splitlines()
+    origin = FAILURE_ORIGIN.match(lines[-1].strip()) if lines else None
+    if origin is None:
+        return "unclassified"
+    kind = origin["type"].rsplit(".", 1)[-1]
+    if kind in ASSERTION_TYPES:
+        return "assertion"
+    if kind in DEPENDENCY_TYPES:
+        return "dependency"
+    if Path(origin["path"]).as_posix() in scope:
+        return "target-exception"
+    return "unclassified"
+
+
+def classify_junit(root, scope):
+    """Per-test classes from a pytest junit report. <error> is collection or setup, never a kill."""
+    tests = {}
+    for case in root.iter("testcase"):
+        name = f"{case.get('classname')}::{case.get('name')}"
+        failure, error = case.find("failure"), case.find("error")
+        if failure is not None:
+            tests[name] = classify_failure(failure.text, scope)
+        elif error is not None:
+            tests[name] = "collection" if error.get("message") == "collection failure" else "setup"
+    return tests
 
 
 def witness_suite(pack):
@@ -87,29 +126,27 @@ def witness_suite(pack):
             "timeouts": timeouts, "errors": errors, "fixtures": len(data["rows"])}
 
 
-def upstream_suite(tree, argv, timeout):
-    """pytest junit: <failure> is behavioral; setup/collection <error> or other exits are not kills."""
+def upstream_suite(tree, argv, timeout, scope):
+    """pytest junit classes: assertion and target-exception are kills; dependency, collection and
+    setup failures are errors; any other failure is unclassified and goes to adjudication."""
     with tempfile.TemporaryDirectory() as tmp:
         report = Path(tmp, "junit.xml")
         try:
-            done = subprocess.run([*argv, f"--junitxml={report}"], cwd=tree, capture_output=True,
+            done = subprocess.run([*argv, "--tb=long", f"--junitxml={report}"], cwd=tree, capture_output=True,
                                   text=True, timeout=timeout)
         except subprocess.TimeoutExpired:
-            return {"class": "timeout", "behavioral": [], "timeouts": [f"suite exceeded {timeout}s"], "errors": []}
-        failures, errors = [], []
-        if report.is_file():
-            for case in ET.parse(report).getroot().iter("testcase"):
-                name = f"{case.get('classname')}::{case.get('name')}"
-                if case.find("failure") is not None:
-                    failures.append(name)
-                elif case.find("error") is not None:
-                    errors.append(name)
-        if done.returncode and not failures:
-            errors.append(f"exit {done.returncode}: {(done.stdout + done.stderr)[-500:]}")
-        if not done.returncode and (failures or errors):
-            errors.append("exit 0 with recorded failures or errors")
-    return {"class": classify(failures, [], errors), "behavioral": failures, "timeouts": [], "errors": errors,
-            "exit": done.returncode}
+            return {"class": "timeout", "behavioral": [], "timeouts": [f"suite exceeded {timeout}s"], "errors": [],
+                    "unclassified": [], "tests": {}}
+        tests = classify_junit(ET.parse(report).getroot(), scope) if report.is_file() else {}
+    behavioral = sorted(t for t, c in tests.items() if c in ("assertion", "target-exception"))
+    unclassified = sorted(t for t, c in tests.items() if c == "unclassified")
+    errors = sorted(f"{t}: {c}" for t, c in tests.items() if c in ("dependency", "collection", "setup"))
+    if done.returncode and not tests:
+        errors.append(f"exit {done.returncode}: {(done.stdout + done.stderr)[-500:]}")
+    if not done.returncode and tests:
+        errors.append("exit 0 with recorded failures or errors")
+    return {"class": classify(behavioral, [], errors, unclassified), "behavioral": behavioral, "timeouts": [],
+            "errors": errors, "unclassified": unclassified, "tests": tests, "exit": done.returncode}
 
 
 def run_suites(args, tree):
@@ -121,7 +158,7 @@ def run_suites(args, tree):
             start = time.monotonic()
             purge_bytecode(tree)
             result = (witness_suite(args.pack) if suite == "witness"
-                      else upstream_suite(tree, args.upstream, args.upstream_timeout))
+                      else upstream_suite(tree, args.upstream, args.upstream_timeout, set(args.scope)))
             result["seconds"] = round(time.monotonic() - start, 3)
             attempts.append(result)
             if result["class"] != "error":
@@ -164,7 +201,8 @@ def enumerate_mutants(args):
     keys = []
     for line in dump.splitlines():
         (mutation,) = json.loads(line)[0]["mutations"]
-        keys.append({"path": Path(mutation["module_path"]).relative_to(tree).as_posix(),
+        path = Path(mutation["module_path"]).relative_to(tree).as_posix()
+        keys.append({"id": f"{path}:{mutation['operator_name']}:{mutation['occurrence']}", "path": path,
                      "operator": mutation["operator_name"], "occurrence": mutation["occurrence"],
                      "line": mutation["start_pos"][0], "definition": mutation.get("definition_name")})
     keys.sort(key=lambda k: (k["path"], k["operator"], k["occurrence"]))
@@ -213,10 +251,24 @@ class Knockout(ast.NodeTransformer):
     visit_AsyncFunctionDef = visit_FunctionDef
 
 
+def knockout_status(fixtures, changed, blocked, errored):
+    """Only observed changes count. Blocked or errored cases can never make the check pass;
+    they make it insufficient when they could decide the outcome."""
+    if not fixtures:
+        return "insufficient-evidence"
+    if changed / fixtures >= KNOCKOUT_THRESHOLD:
+        return "pass"
+    if (changed + blocked + errored) / fixtures >= KNOCKOUT_THRESHOLD:
+        return "insufficient-evidence"
+    return "fail"
+
+
 def knockout(args):
     """Adapter honesty: replace every target-scope function body with a raise.
 
-    A fixture whose observation does not change never reached target-scope functions.
+    changed: the observation differs from the frozen baseline (reached_target: it carries the knockout).
+    unchanged: identical observation, so the fixture never reached target-scope functions.
+    blocked: the case timed out. errored: the harness could not run it (for example an import failure).
     """
     tree = Path(args.tree).resolve()
     require_clean(tree)
@@ -227,19 +279,48 @@ def knockout(args):
         pack = Path(args.pack).resolve()
         data = json.loads((pack / "tests" / "observations.json").read_text())
         root = resolve_source_root(pack, json.loads((pack / "manifest.json").read_text()))
-        changed, unchanged, errored = [], [], []
+        cases = {"changed": [], "unchanged": [], "blocked": [], "errored": []}
+        reached = []
         for row in data["rows"]:
             purge_bytecode(tree)
             try:
                 observed = run_case(root / data["legacy"], row["input"])
-            except RuntimeError:
-                errored.append(row["name"])
+            except RuntimeError as exc:
+                cases["blocked" if "timed out" in str(exc) else "errored"].append(row["name"])
                 continue
-            (unchanged if observation_json(observed) == observation_json(row["legacy"]) else changed).append(row["name"])
+            if observation_json(observed) == observation_json(row["legacy"]):
+                cases["unchanged"].append(row["name"])
+                continue
+            cases["changed"].append(row["name"])
+            if "code-witness knockout" in json.dumps(observed.get("exception")):
+                reached.append(row["name"])
     finally:
         restore(tree)
-    print(json.dumps({"fixtures": len(data["rows"]), "changed": len(changed), "errored": errored,
-                      "unchanged": unchanged}, indent=2))
+    counts = {kind: len(names) for kind, names in cases.items()}
+    print(json.dumps({"fixtures": len(data["rows"]), "counts": counts, "reached_target": len(reached),
+                      "threshold": KNOCKOUT_THRESHOLD,
+                      "status": knockout_status(len(data["rows"]), counts["changed"], counts["blocked"], counts["errored"]),
+                      "cases": cases}, indent=2))
+
+
+def run_challenges(args):
+    """Apply each challenge patch once, score the tree as it is, restore, and record."""
+    tree = Path(args.tree).resolve()
+    with open(args.out, "a") as out:
+        for challenge in args.ids:
+            patch = Path(args.dir, f"{challenge}.patch").resolve()
+            require_clean(tree)
+            try:
+                subprocess.run(["git", "-C", str(tree), "apply", str(patch)], check=True, capture_output=True)
+                diff = git(tree, "diff")
+                record = {"id": challenge, "kind": "regression" if challenge.startswith("R") else "control",
+                          "diff_sha256": digest(diff), "suites": run_suites(args, tree)}
+                if digest(git(tree, "diff")) != record["diff_sha256"]:
+                    raise SystemExit(f"S5: challenge source changed during scoring: {challenge}")
+            finally:
+                restore(tree)
+            out.write(json.dumps(record) + "\n")
+            out.flush()
 
 
 def main(argv=None):
@@ -252,9 +333,12 @@ def main(argv=None):
     listing.add_argument("--cap", type=int, default=400)
     listing.add_argument("--out", required=True)
     for name, helptext in (("run", "Apply each mutant once and score the selected suites against it"),
-                           ("check", "Score the selected suites on the tree as it is")):
+                           ("check", "Score the selected suites on the tree as it is"),
+                           ("challenges", "Apply each challenge patch once and score the selected suites against it")):
         command = commands.add_parser(name, help=helptext)
         command.add_argument("--tree", required=True)
+        command.add_argument("--scope", nargs="+", default=[],
+                             help="Target-scope files, relative to the tree (classifies upstream failure origins)")
         command.add_argument("--suites", nargs="+", choices=("witness", "upstream"), default=["witness", "upstream"])
         command.add_argument("--pack", help="Frozen contract pack (required for the witness suite)")
         command.add_argument("--upstream", type=json.loads, default=[],
@@ -267,6 +351,10 @@ def main(argv=None):
             command.add_argument("--stop", type=int)
             command.add_argument("--import-root", default=".")
             command.add_argument("--import-module", nargs="*", default=[])
+        elif name == "challenges":
+            command.add_argument("--dir", required=True, help="Directory holding <id>.patch files")
+            command.add_argument("--ids", nargs="+", required=True, help="Valid challenge ids, in ID order")
+            command.add_argument("--out", required=True)
         else:
             command.add_argument("--runs", type=int, default=1)
     honesty = commands.add_parser("knockout", help="Adapter honesty check against target-scope functions")
@@ -274,12 +362,13 @@ def main(argv=None):
     honesty.add_argument("--scope", nargs="+", required=True)
     honesty.add_argument("--pack", required=True)
     args = parser.parse_args(argv)
-    if args.command in ("run", "check"):
+    if args.command in ("run", "check", "challenges"):
         if "witness" in args.suites and not args.pack:
             parser.error("--pack is required for the witness suite")
-        if "upstream" in args.suites and not args.upstream:
-            parser.error("--upstream is required for the upstream suite")
-    {"mutants": enumerate_mutants, "run": run_mutants, "check": check_current, "knockout": knockout}[args.command](args)
+        if "upstream" in args.suites and not (args.upstream and args.scope):
+            parser.error("--upstream and --scope are required for the upstream suite")
+    {"mutants": enumerate_mutants, "run": run_mutants, "check": check_current, "knockout": knockout,
+     "challenges": run_challenges}[args.command](args)
 
 
 if __name__ == "__main__":

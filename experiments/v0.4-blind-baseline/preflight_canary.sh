@@ -38,14 +38,14 @@ score() { "$python" "$here/score.py" "$@"; }
 upstream=$(printf '["%s", "-m", "pytest", "-q", "-x", "-p", "no:cacheprovider", "tests"]' "$python")
 
 extract batch.py
-score check --tree "$tree" --pack "$tree/_witness/pack" --upstream "$upstream" --runs 3 > "$out/clean.json"
+score check --tree "$tree" --scope canary/core.py canary/util.py --pack "$tree/_witness/pack" --upstream "$upstream" --runs 3 > "$out/clean.json"
 score mutants --tree "$tree" --scope canary/core.py canary/util.py --seed 20261023 --out "$out/mutants.json"
-score run --tree "$tree" --pack "$tree/_witness/pack" --upstream "$upstream" --mutants "$out/mutants.json" \
+score run --tree "$tree" --scope canary/core.py canary/util.py --pack "$tree/_witness/pack" --upstream "$upstream" --mutants "$out/mutants.json" \
   --import-module canary.core --out "$out/results.jsonl"
 
 # Infrastructure fault: a missing upstream test path must be an error, never a kill.
 bad=$(printf '["%s", "-m", "pytest", "-q", "-p", "no:cacheprovider", "missing_tests"]' "$python")
-score run --tree "$tree" --suites upstream --upstream "$bad" --mutants "$out/mutants.json" --stop 1 \
+score run --tree "$tree" --scope canary/core.py canary/util.py --suites upstream --upstream "$bad" --mutants "$out/mutants.json" --stop 1 \
   --out "$out/infra.jsonl"
 
 # Stale bytecode: warm the cache, then make a same-size edit with the original mtime.
@@ -75,6 +75,7 @@ rows = [json.loads(line) for line in (out / "results.jsonl").read_text().splitli
 valid = [r for r in rows if r["validity"] == "valid"]
 classes = lambda suite: [r["suites"][suite]["class"] for r in valid]
 infra = json.loads((out / "infra.jsonl").read_text())["suites"]["upstream"]
+upstream_tests = {c for r in valid for c in r["suites"]["upstream"]["tests"].values()}
 honest, dishonest = load("knockout-honest.json"), load("knockout-dishonest.json")
 status = subprocess.run(["git", "-C", tree, "status", "--porcelain", "--untracked-files=all"],
                         capture_output=True, text=True).stdout
@@ -87,8 +88,9 @@ checks = {
     "no unexplained errors on canary mutants": "error" not in classes("witness") + classes("upstream"),
     "missing test path is an error, not a kill": infra["class"] == "error",
     "stale-bytecode edit is detected": load("stale.json")["runs"][0]["witness"]["class"] == "behavioral",
-    "honest adapter: every fixture reaches target code": honest["changed"] + len(honest["errored"]) == honest["fixtures"] and not honest["unchanged"],
-    "dishonest adapter: no fixture reaches target code": dishonest["changed"] == 0 and len(dishonest["unchanged"]) == dishonest["fixtures"],
+    "honest adapter: knockout passes on observed changes": honest["status"] == "pass" and honest["counts"]["changed"] == honest["fixtures"],
+    "dishonest adapter: knockout fails, no observed change": dishonest["status"] == "fail" and dishonest["counts"]["changed"] == 0,
+    "upstream target exceptions classified, nothing unclassified": "target-exception" in upstream_tests and "unclassified" not in upstream_tests,
     "tree restored after scoring": status == "",
     "sentinels outside the tree intact": (out / "outside/sentinel.txt").read_text() == "sentinel\n"
         and (out / "outside/__pycache__/sentinel.pyc").is_file(),
