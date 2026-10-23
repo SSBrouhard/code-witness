@@ -1,0 +1,103 @@
+[
+  {
+    "name": "score-bonus",
+    "input": {
+      "op": "score",
+      "points": 10,
+      "bonus": 5
+    },
+    "result": 15
+  },
+  {
+    "name": "score-negative",
+    "input": {
+      "op": "score",
+      "points": -1
+    },
+    "exception": [
+      "ValueError",
+      "points must be nonnegative"
+    ]
+  },
+  {
+    "name": "score-zero",
+    "input": {
+      "op": "score",
+      "points": 0
+    },
+    "result": 0
+  },
+  {
+    "name": "score-clamp-high",
+    "input": {
+      "op": "score",
+      "points": 99,
+      "bonus": 5
+    },
+    "result": 100
+  },
+  {
+    "name": "score-exact-max",
+    "input": {
+      "op": "score",
+      "points": 100
+    },
+    "result": 100
+  },
+  {
+    "name": "label-49",
+    "input": {
+      "op": "label",
+      "points": 49
+    },
+    "result": "low"
+  },
+  {
+    "name": "label-50",
+    "input": {
+      "op": "label",
+      "points": 50
+    },
+    "result": "mid"
+  },
+  {
+    "name": "label-89",
+    "input": {
+      "op": "label",
+      "points": 89
+    },
+    "result": "mid"
+  },
+  {
+    "name": "label-90",
+    "input": {
+      "op": "label",
+      "points": 90
+    },
+    "result": "high"
+  },
+  {
+    "name": "label-over-max",
+    "input": {
+      "op": "label",
+      "points": 150
+    },
+    "result": "high"
+  },
+  {
+    "name": "delay-zero",
+    "input": {
+      "op": "delay",
+      "n": 0
+    },
+    "result": 0
+  },
+  {
+    "name": "delay-three",
+    "input": {
+      "op": "delay",
+      "n": 3
+    },
+    "result": 3
+  }
+]

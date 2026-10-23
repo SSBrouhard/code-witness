@@ -1,0 +1,88 @@
+[
+  {
+    "name": "score-bonus",
+    "input": {
+      "op": "score",
+      "points": 10,
+      "bonus": 5
+    }
+  },
+  {
+    "name": "score-negative",
+    "input": {
+      "op": "score",
+      "points": -1
+    }
+  },
+  {
+    "name": "score-zero",
+    "input": {
+      "op": "score",
+      "points": 0
+    }
+  },
+  {
+    "name": "score-clamp-high",
+    "input": {
+      "op": "score",
+      "points": 99,
+      "bonus": 5
+    }
+  },
+  {
+    "name": "score-exact-max",
+    "input": {
+      "op": "score",
+      "points": 100
+    }
+  },
+  {
+    "name": "label-49",
+    "input": {
+      "op": "label",
+      "points": 49
+    }
+  },
+  {
+    "name": "label-50",
+    "input": {
+      "op": "label",
+      "points": 50
+    }
+  },
+  {
+    "name": "label-89",
+    "input": {
+      "op": "label",
+      "points": 89
+    }
+  },
+  {
+    "name": "label-90",
+    "input": {
+      "op": "label",
+      "points": 90
+    }
+  },
+  {
+    "name": "label-over-max",
+    "input": {
+      "op": "label",
+      "points": 150
+    }
+  },
+  {
+    "name": "delay-zero",
+    "input": {
+      "op": "delay",
+      "n": 0
+    }
+  },
+  {
+    "name": "delay-three",
+    "input": {
+      "op": "delay",
+      "n": 3
+    }
+  }
+]

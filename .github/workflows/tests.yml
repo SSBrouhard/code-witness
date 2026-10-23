@@ -25,3 +25,18 @@ jobs:
       - run: python -m unittest discover -s tests -v
       - run: python -m pip install "pytest>=8,<10"
       - run: python -m unittest discover -s experiments/v0.4-blind-baseline/tests -v
+      - run: python -m pip install "cosmic-ray==8.7.0"
+      - run: python -m unittest discover -s experiments/v0.5-comparison/tests -v
+
+  v05-canary-preflight:
+    # Preflight P2 to P5 and P7 of docs/v0.5-comparison-protocol.md on the committed canary.
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: python -m pip install -e . "cosmic-ray==8.7.0" "coverage==7.17.0" "pytest==9.1.1"
+      - run: git config --global init.defaultBranch main
+      - run: python experiments/v0.5-comparison/preflight_canary.py "$RUNNER_TEMP/v05-preflight"
