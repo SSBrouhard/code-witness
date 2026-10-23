@@ -37,7 +37,27 @@ def load(directory, name):
     return json.loads(path.read_text()) if path.is_file() else None
 
 
+def adjudication_records(evidence):
+    """Every verdict key (question, id, suite) must appear once. A repeated key is refused, identical or
+    conflicting: picking one of several verdicts would be a judgment the record does not contain."""
+    rows = load(evidence, "ADJUDICATION.jsonl")
+    seen, repeated = {}, {}
+    for number, row in enumerate(rows, 1):
+        key = (row["question"], row["id"], row.get("suite"))
+        if key in seen:
+            repeated.setdefault(key, [seen[key]]).append(number)
+        else:
+            seen[key] = number
+    if repeated:
+        detail = "; ".join(f"{q} {i}" + (f" ({s})" if s else "") + f": lines {', '.join(map(str, lines))}" + (
+            " (conflicting verdicts)" if len({rows[n - 1]["verdict"] for n in lines}) > 1 else " (identical)")
+            for (q, i, s), lines in sorted(repeated.items(), key=lambda item: item[1]))
+        raise SystemExit(f"ADJUDICATION.jsonl: duplicate verdict records refused: {detail}")
+    return rows
+
+
 def rows_for(adjudication, question):
+    """Keys are unique: adjudication_records refuses duplicates before any verdict is used."""
     return {(row["id"], row.get("suite")): row for row in adjudication if row["question"] == question}
 
 
@@ -233,7 +253,7 @@ def as_number(value):
 
 def compare(evidence):
     labels = load(evidence, "LABELS.json")
-    adjudication = load(evidence, "ADJUDICATION.jsonl")
+    adjudication = adjudication_records(evidence)
     validity = check_validity(evidence, labels)
     g1 = clean_replay(evidence)
     usable = [s for s in (*LABELS, UPSTREAM) if g1[s]]

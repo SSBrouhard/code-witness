@@ -4,9 +4,11 @@ Deterministic support for docs/v0.5-comparison-protocol.md. Not part of debt-com
 No command here runs through a shell; cosmic-ray is used only to enumerate and apply mutants.
 
 Suites are declared in a JSON file. Relative trees resolve against that file's directory; pack,
-adapter and cases resolve against the suite's own tree:
+adapter, cases and deliverable resolve against the suite's own tree. A deliverable (default _witness/ for
+witness suites; declared for pytest suites) is fingerprinted, and any change to it stops scoring:
   [{"name": "W", "kind": "witness", "tree": "trees/W", "pack": "_witness/pack"},
-   {"name": "X", "kind": "pytest", "tree": "trees/X", "timeout": 60, "env": {"PYTHONPATH": "."},
+   {"name": "X", "kind": "pytest", "tree": "trees/X", "deliverable": "_characterization", "timeout": 60,
+    "env": {"PYTHONPATH": "."},
     "argv": ["/abs/python", "-m", "pytest", "-q", "-p", "no:cacheprovider", "-c", "_characterization/pytest.ini",
              "--rootdir=_characterization", "--confcutdir=_characterization", "_characterization/tests"]},
    {"name": "upstream", "kind": "pytest", "tree": "trees/upstream", "timeout": 60, "argv": [...]}]
@@ -42,6 +44,8 @@ FAILURE_ORIGIN = re.compile(r"^(?P<path>.+?):(?P<line>\d+): (?P<type>[A-Za-z_][\
 ASSERTION_TYPES = {"AssertionError", "Failed"}  # Failed: pytest.raises/fail outcomes such as DID NOT RAISE
 DEPENDENCY_TYPES = {"ImportError", "ModuleNotFoundError"}
 KILL_CLASSES = ("assertion", "target-exception")
+INCIDENTAL_DIRS = {"__pycache__", ".pytest_cache"}
+INCIDENTAL_SUFFIXES = {".pyc", ".pyo"}
 ERROR_CLASSES = ("dependency", "collection", "setup")
 # Loaded with -p from a private directory; reverses collection order for the reproducibility check.
 REVERSE_PLUGIN = "def pytest_collection_modifyitems(session, config, items):\n    items.reverse()\n"
@@ -76,6 +80,41 @@ def digest(text):
     return hashlib.sha256(text.encode()).hexdigest()
 
 
+def fingerprint(directory):
+    """SHA-256 of every file in a frozen deliverable, by relative path. Deliverables are excluded from
+    git, so this is what shows they did not change. Python caches are incidental and ignored."""
+    if directory is None or not directory.is_dir():
+        return None
+    files = {}
+    for path in sorted(directory.rglob("*")):
+        relative = path.relative_to(directory)
+        if INCIDENTAL_DIRS & set(relative.parts[:-1] if path.is_file() else relative.parts) \
+                or path.suffix in INCIDENTAL_SUFFIXES:
+            continue
+        if path.is_symlink():
+            files[relative.as_posix()] = "symlink:" + os.readlink(path)
+        elif path.is_file():
+            files[relative.as_posix()] = hashlib.sha256(path.read_bytes()).hexdigest()
+    return files
+
+
+def snapshot(suites):
+    return {s["name"]: fingerprint(s["deliverable"]) for s in suites if s["deliverable"] is not None}
+
+
+def require_frozen(suites, expected, label):
+    """Stop (S5) if any frozen deliverable gained, lost or changed a file since scoring started."""
+    current = snapshot(suites)
+    changed = {}
+    for name, before in expected.items():
+        after = current.get(name)
+        if after != before:
+            before, after = before or {}, after or {}
+            changed[name] = sorted(f for f in set(before) | set(after) if before.get(f) != after.get(f)) or ["<missing>"]
+    if changed:
+        raise SystemExit(f"S5: frozen deliverable changed during scoring ({label}): {json.dumps(changed)}")
+
+
 def load_suites(path):
     """Validated suite declarations with absolute paths. Names are unique; trees are distinct."""
     path = Path(path).resolve()
@@ -91,11 +130,13 @@ def load_suites(path):
             entry["pack"] = tree / suite.get("pack", "_witness/pack")
             entry["adapter"] = tree / suite.get("adapter", "_witness/slice/legacy/batch.py")
             entry["cases"] = tree / suite.get("cases", "_witness/slice/fixtures/cases.json")
+            entry["deliverable"] = tree / suite.get("deliverable", "_witness")
         elif entry["kind"] == "pytest":
             argv = suite.get("argv")
             if not argv or argv[1:3] != ["-m", "pytest"]:
                 raise SystemExit(f"suites: {suite['name']}: argv must start with PYTHON -m pytest")
-            entry.update(argv=list(argv), env=dict(suite.get("env", {})), timeout=float(suite.get("timeout", 300)))
+            entry.update(argv=list(argv), env=dict(suite.get("env", {})), timeout=float(suite.get("timeout", 300)),
+                         deliverable=tree / suite["deliverable"] if suite.get("deliverable") else None)
         else:
             raise SystemExit(f"suites: {suite['name']}: kind must be witness or pytest")
         resolved.append(entry)
@@ -281,6 +322,7 @@ def enumerate_mutants(args):
 def run_mutants(args):
     suites = load_suites(args.suites)
     mutants = json.loads(Path(args.mutants).read_text())["selected"][args.start:args.stop]
+    frozen = snapshot(suites)
     with open(args.out, "a") as out:
         for mutant in mutants:
             for suite in suites:
@@ -303,6 +345,7 @@ def run_mutants(args):
             finally:
                 for suite in suites:
                     restore(suite["tree"])
+            require_frozen(suites, frozen, mutant["id"])
             out.write(json.dumps(record) + "\n")
             out.flush()
 
@@ -311,13 +354,20 @@ def check_current(args):
     """Score every tree exactly as it is: clean replay, or a preflight probe."""
     suites = load_suites(args.suites)
     diff = identical_diff(suites, "check")
-    runs = [run_suites(suites, set(args.scope)) for _ in range(args.runs)]
-    print(json.dumps({"diff_sha256": digest(diff), "runs": runs}, indent=2))
+    frozen = snapshot(suites)
+    runs = []
+    for number in range(args.runs):
+        runs.append(run_suites(suites, set(args.scope)))
+        require_frozen(suites, frozen, f"check run {number + 1}")
+    print(json.dumps({"diff_sha256": digest(diff), "runs": runs,
+                      "deliverables": {name: digest(json.dumps(files, sort_keys=True)) for name, files in frozen.items()}},
+                     indent=2))
 
 
 def run_challenges(args):
     """Apply each challenge patch to every suite tree, score, restore, and record."""
     suites = load_suites(args.suites)
+    frozen = snapshot(suites)
     with open(args.out, "a") as out:
         for challenge in args.ids:
             patch = Path(args.dir, f"{challenge}.patch").resolve()
@@ -335,6 +385,7 @@ def run_challenges(args):
             finally:
                 for suite in suites:
                     restore(suite["tree"])
+            require_frozen(suites, frozen, challenge)
             out.write(json.dumps(record) + "\n")
             out.flush()
 
@@ -413,6 +464,7 @@ def knockout(args):
     (suite,) = [s for s in load_suites(args.suites) if s["name"] == args.suite]
     tree, scope = suite["tree"], set(args.scope)
     require_clean(tree)
+    frozen = snapshot([suite])
     clean_cases = None
     if suite["kind"] == "pytest":
         purge_bytecode(tree)
@@ -429,6 +481,7 @@ def knockout(args):
             units, cases, reached = pytest_knockout_cases(clean_cases, knocked, code is None)
     finally:
         restore(tree)
+    require_frozen([suite], frozen, "knockout")
     counts = {kind: len(names) for kind, names in cases.items()}
     print(json.dumps({"suite": suite["name"], "kind": suite["kind"], "units": len(units), "counts": counts,
                       "reached_target": len(reached), "threshold": KNOCKOUT_THRESHOLD,
@@ -446,7 +499,11 @@ def reproduce(args):
     tree = work / f"replay-{suite['name']}" / "repo"
     subprocess.run(["git", "clone", "-q", str(Path(args.repo).resolve()), str(tree)], check=True, capture_output=True)
     deliverable = Path(args.deliverable).resolve()
+    source = fingerprint(deliverable)
     shutil.copytree(deliverable, tree / deliverable.name)
+    copy = tree / deliverable.name
+    if fingerprint(copy) != source:
+        raise SystemExit("S5: the replay copy of the deliverable differs from the frozen deliverable")
     python = str(Path(args.python).absolute())
     # Works in environments built without pip (for example by uv).
     freeze = subprocess.run([python, "-c", "import importlib.metadata as m; print('\\n'.join(sorted("
@@ -477,6 +534,9 @@ def reproduce(args):
                                                            "tail": (done.stdout + done.stderr)[-500:]}
         result = witness_suite({**suite, "tree": tree, "pack": pack})
         variants["scorer-replay"] = {"class": result["class"], "pass": result["class"] == "survived"}
+    for location, files in (("frozen", fingerprint(deliverable)), ("replay copy", fingerprint(copy))):
+        if files != source:
+            raise SystemExit(f"S5: the {location} deliverable changed during the replay")
     print(json.dumps({"suite": suite["name"], "path": str(tree), "python": python,
                       "pip_freeze": freeze.stdout.splitlines(), "variants": variants,
                       "pass": all(v["pass"] for v in variants.values())}, indent=2))
@@ -485,6 +545,7 @@ def reproduce(args):
 def measure_coverage(args):
     """Target-scope line and branch coverage for one suite, measured on its own tree."""
     (suite,) = [s for s in load_suites(args.suites) if s["name"] == args.suite]
+    frozen = snapshot([suite])
     data = Path(args.data_file).resolve()
     include = "--include=" + ",".join(args.include)
     if suite["kind"] == "witness":
@@ -508,6 +569,7 @@ def measure_coverage(args):
                                               max(totals.get("num_branches", 0), 1), 2),
                       "totals": totals}, indent=2))
     restore(suite["tree"])
+    require_frozen([suite], frozen, "coverage")
 
 
 def main(argv=None):

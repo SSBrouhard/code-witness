@@ -152,7 +152,7 @@ class PytestSuites(unittest.TestCase):
     def char(self, name, suite, decoys=True):
         git_tree(self.tmp / name, suite, decoys)
         return {"name": name, "kind": "pytest", "tree": name, "argv": CHAR_ARGV, "env": {"PYTHONPATH": "."},
-                "timeout": 30}
+                "deliverable": "_characterization", "timeout": 30}
 
     def test_fixed_command_ignores_upstream_configuration(self):
         suites = self.suites(self.char("B", "honest"))
@@ -170,6 +170,45 @@ class PytestSuites(unittest.TestCase):
         with self.assertRaises(SystemExit) as stopped:
             call("check", "--suites", suites, "--scope", *SCOPE)
         self.assertIn("S5: suite trees differ", str(stopped.exception))
+
+    def tampering(self, name):
+        entry = self.char(name, "honest")
+        (self.tmp / name / "_characterization/tests/test_tamper.py").write_text(
+            "from pathlib import Path\n\n\ndef test_writes_into_its_own_deliverable():\n"
+            "    Path(__file__).parent.with_name('written.txt').write_text('changed')\n")
+        return entry
+
+    def test_a_suite_changing_its_frozen_deliverable_stops_scoring(self):
+        suites = self.suites(self.tampering("T"))
+        with self.assertRaises(SystemExit) as stopped:
+            call("check", "--suites", suites, "--scope", *SCOPE)
+        self.assertIn("S5: frozen deliverable changed during scoring (check run 1)", str(stopped.exception))
+        self.assertIn("written.txt", str(stopped.exception))
+
+    def test_a_changed_deliverable_records_no_challenge_result(self):
+        suites = self.suites(self.tampering("T"))
+        patches = self.tmp / "patches"
+        patches.mkdir()
+        util = self.tmp / "T/canary/util.py"
+        util.write_text(util.read_text().replace("min(value, high))", "min(value, high))  # same behavior"))
+        (patches / "N01.patch").write_text(subprocess.run(["git", "-C", str(self.tmp / "T"), "diff"],
+                                                          capture_output=True, text=True, check=True).stdout)
+        subprocess.run(["git", "-C", str(self.tmp / "T"), "checkout", "-q", "--", "."], check=True)
+        out = self.tmp / "challenges.jsonl"
+        with self.assertRaises(SystemExit) as stopped:
+            call("challenges", "--suites", suites, "--scope", *SCOPE, "--dir", patches, "--ids", "N01", "--out", out)
+        self.assertIn("(N01)", str(stopped.exception))
+        self.assertEqual(out.read_text(), "")
+
+    def test_bytecode_written_into_a_deliverable_does_not_stop_scoring(self):
+        entry = self.char("P", "honest")
+        (self.tmp / "P/_characterization/tests/test_cache.py").write_text(
+            "from pathlib import Path\n\n\ndef test_writes_a_cache_file():\n"
+            "    cache = Path(__file__).parent / '__pycache__'\n    cache.mkdir(exist_ok=True)\n"
+            "    (cache / 'x.cpython-313.pyc').write_bytes(b'cache')\n")
+        result = call("check", "--suites", self.suites(entry), "--scope", *SCOPE)
+        self.assertEqual(result["runs"][0]["P"]["class"], "survived")
+        self.assertIn("P", result["deliverables"])
 
     def test_pytest_knockout_detects_a_dishonest_suite(self):
         suites = self.suites(self.char("B", "honest"), self.char("D", "dishonest"))
@@ -194,6 +233,43 @@ class PytestSuites(unittest.TestCase):
         self.assertNotEqual(Path(result["path"]).resolve(), (self.tmp / "O").resolve())
 
 
+class DeliverableFingerprint(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp)
+        self.deliverable = self.tmp / "tree/_witness"
+        (self.deliverable / "pack/tests").mkdir(parents=True)
+        (self.deliverable / "pack/tests/observations.json").write_text("{}")
+        (self.deliverable / "BASELINE.md").write_text("baseline")
+        (self.tmp / "suites.json").write_text(json.dumps([{"name": "W", "kind": "witness", "tree": "tree"}]))
+        self.suites = score.load_suites(self.tmp / "suites.json")
+        self.frozen = score.snapshot(self.suites)
+
+    def test_witness_deliverable_defaults_to_witness_directory(self):
+        self.assertEqual(self.suites[0]["deliverable"], self.deliverable.resolve())
+        self.assertEqual(set(self.frozen["W"]), {"BASELINE.md", "pack/tests/observations.json"})
+
+    def test_python_caches_are_incidental(self):
+        for cache in ("pack/__pycache__/x.cpython-313.pyc", "slice/legacy/batch.pyc", ".pytest_cache/v/cache/x"):
+            (self.deliverable / cache).parent.mkdir(parents=True, exist_ok=True)
+            (self.deliverable / cache).write_text("cache")
+        score.require_frozen(self.suites, self.frozen, "caches")
+
+    def test_changed_added_and_removed_files_stop_scoring(self):
+        edits = (lambda: (self.deliverable / "pack/tests/observations.json").write_text('{"rows": []}'),
+                 lambda: (self.deliverable / "NEW.md").write_text("added"),
+                 lambda: (self.deliverable / "BASELINE.md").unlink(),
+                 lambda: shutil.rmtree(self.deliverable))
+        names = ("pack/tests/observations.json", "NEW.md", "BASELINE.md", "BASELINE.md")
+        for edit, name in zip(edits, names):
+            self.setUp()
+            edit()
+            with self.assertRaises(SystemExit) as stopped:
+                score.require_frozen(self.suites, self.frozen, "edit")
+            self.assertIn("S5: frozen deliverable changed", str(stopped.exception))
+            self.assertIn(name, str(stopped.exception))
+
+
 @unittest.skipUnless(HAS_COSMIC and importlib.util.find_spec("pytest"), "cosmic-ray is not installed")
 class MutantsAcrossTrees(unittest.TestCase):
     def test_each_mutant_reaches_every_tree_identically_and_trees_are_restored(self):
@@ -203,7 +279,8 @@ class MutantsAcrossTrees(unittest.TestCase):
             git_tree(tmp / name, "honest", decoys=True)
         git_tree(tmp / "upstream")
         (tmp / "suites.json").write_text(json.dumps([
-            {"name": n, "kind": "pytest", "tree": n, "argv": CHAR_ARGV, "env": {"PYTHONPATH": "."}, "timeout": 10}
+            {"name": n, "kind": "pytest", "tree": n, "argv": CHAR_ARGV, "env": {"PYTHONPATH": "."}, "timeout": 10,
+             "deliverable": "_characterization"}
             for n in ("B", "B2")] + [{"name": "upstream", "kind": "pytest", "tree": "upstream", "timeout": 10,
                                       "argv": [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", "tests"]}]))
         call("mutants", "--tree", tmp / "upstream", "--scope", *SCOPE, "--seed", "1", "--cap", "6",

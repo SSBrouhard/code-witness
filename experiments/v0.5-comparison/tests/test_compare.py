@@ -370,6 +370,34 @@ class Measures(EvidenceCase):
         self.assertIsNone(result["runs"]["W"]["C"])
         self.assertEqual(result["metrics"]["C"]["result"], "unresolved")
 
+    def test_duplicate_verdicts_are_refused_identical_or_conflicting(self):
+        for extra, kind in (({"question": "oracle-review", "id": "W", "verdict": "none"}, "identical"),
+                            ({"question": "oracle-review", "id": "W", "verdict": "reimplements"}, "conflicting")):
+            evidence = self.evidence()
+            evidence.adjudication.append(extra)
+            with self.assertRaises(SystemExit) as refused:
+                evidence.build()
+            self.assertIn("duplicate verdict records refused: oracle-review W", str(refused.exception))
+            self.assertIn(kind, str(refused.exception))
+
+    def test_a_later_conflicting_verdict_cannot_override_an_earlier_one(self):
+        evidence = self.evidence(upstream_k=99)
+        evidence.adjudication += [{"question": "equivalence", "id": "m099", "verdict": "equivalent"},
+                                  {"question": "equivalence", "id": "m099", "verdict": "not-equivalent",
+                                   "confirmed": True}]
+        with self.assertRaises(SystemExit) as refused:
+            evidence.build()
+        self.assertIn("equivalence m099", str(refused.exception))
+
+    def test_same_id_under_another_suite_or_question_is_not_a_duplicate(self):
+        evidence = self.evidence()
+        evidence.extra_mutant_suites = {"m000": {"X": {"class": "adjudicate"}, "Z": {"class": "adjudicate"}}}
+        evidence.adjudication += [
+            {"question": "failure-classification", "id": "m000", "suite": "X", "verdict": "behavioral"},
+            {"question": "failure-classification", "id": "m000", "suite": "Z", "verdict": "behavioral"},
+            {"question": "equivalence", "id": "m000", "verdict": "equivalent"}]
+        self.assertTrue(evidence.build()["valid"])
+
     def test_floor_blocks_go(self):
         result = self.evidence(r={"W": 13, "Y": 13, "X": 13, "Z": 13}).build()
         self.assertEqual(result["metrics"]["K"]["result"], "A")

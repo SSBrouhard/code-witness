@@ -91,7 +91,7 @@ def main():
     commit(stripped)
 
     char = lambda name: {"name": name, "kind": "pytest", "tree": f"trees/{name}", "argv": CHAR_ARGV,
-                         "env": {"PYTHONPATH": "."}, "timeout": 10}
+                         "deliverable": "_characterization", "env": {"PYTHONPATH": "."}, "timeout": 10}
     main_suites = suites_file(out, "suites", [
         {"name": "A", "kind": "witness", "tree": "trees/A"}, char("B"), char("B-self"),
         {"name": "upstream", "kind": "pytest", "tree": "trees/upstream", "argv": UPSTREAM_ARGV, "timeout": 20}])
