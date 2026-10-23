@@ -231,6 +231,41 @@ class Assessment(unittest.TestCase):
         self.assertEqual(result["criteria"]["C3"]["unadjudicated"], ["eq"])
         self.assertEqual(result["outcome"], "Partially useful")
 
+    def test_mutation_results_must_match_selected_ids_exactly(self):
+        records = self.evidence.files["mutants.jsonl"]
+        records[1] = dict(records[0])  # same count as selected: m0 twice, m1 missing
+        result = self.run_assess()["criteria"]["C3"]
+        self.assertEqual(result["status"], "not evaluable")
+        self.assertEqual(result["mutants_scored"], "10/10")
+        self.assertEqual(result["result_identity_gaps"], {"missing": ["m1"], "duplicated": ["m0"], "unexpected": []})
+        records[1] = mutant("stray", "behavioral", "behavioral")
+        result = self.run_assess()["criteria"]["C3"]
+        self.assertEqual((result["status"], result["result_identity_gaps"]["unexpected"]), ("not evaluable", ["stray"]))
+
+    def test_resumed_scoring_with_exact_ids_still_evaluates(self):
+        records = self.evidence.files["mutants.jsonl"]
+        self.evidence.files["mutants.jsonl"] = records[5:] + records[:5]  # appended out of order after a resume
+        self.assertEqual(self.run_assess()["criteria"]["C3"]["status"], "met")
+
+    def test_duplicate_or_missing_challenge_results_are_not_evaluable(self):
+        challenges = self.evidence.files["challenges.jsonl"]
+        challenges.append(dict(challenges[0]))
+        result = self.run_assess()["criteria"]
+        self.assertEqual((result["C4"]["status"], result["C5"]["status"]), ("not evaluable", "not evaluable"))
+        self.assertEqual(result["C4"]["result_identity_gaps"]["duplicated"], ["R01"])
+        challenges.pop()
+        challenges.pop()
+        self.assertEqual(self.run_assess()["criteria"]["C5"]["result_identity_gaps"]["missing"], ["N10"])
+
+    def test_controls_that_did_not_run_make_false_alarms_not_evaluable(self):
+        challenges = self.evidence.files["challenges.jsonl"]
+        for control, outcome in zip(challenges[10:13], ("timeout", "error", "adjudicate"), strict=True):
+            control["suites"]["witness"]["class"] = outcome
+        result = self.run_assess()["criteria"]["C5"]
+        self.assertEqual(result["status"], "not evaluable")
+        self.assertEqual(result["false_alarms"], [])
+        self.assertEqual(result["untested_controls"], {"N01": "timeout", "N02": "error", "N03": "adjudicate"})
+
     def test_regressions_need_ten_valid_and_seven_detected(self):
         challenges = self.evidence.files["challenges.jsonl"]
         challenges[7]["suites"]["witness"]["class"] = "survived"

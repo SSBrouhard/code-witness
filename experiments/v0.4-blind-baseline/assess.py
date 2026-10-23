@@ -90,9 +90,18 @@ def kill(record, suite, failure_verdicts):
     return False
 
 
+def identity_gaps(expected, rows):
+    """Every expected id must appear exactly once: counts alone hide a duplicate plus a missing row."""
+    seen = [row["id"] for row in rows]
+    duplicated = sorted({i for i in seen if seen.count(i) > 1})
+    return {"missing": sorted(set(expected) - set(seen)), "duplicated": duplicated,
+            "unexpected": sorted(set(seen) - set(expected))}
+
+
 def assess_mutation(evidence, adjudication):
     records = load(evidence, "mutants.jsonl")
     selected = (load(evidence, "mutants.json") or {}).get("selected", [])
+    gaps = identity_gaps([m["id"] for m in selected], records)
     validity = {}
     for record in records:
         validity[record["validity"]] = validity.get(record["validity"], 0) + 1
@@ -119,7 +128,8 @@ def assess_mutation(evidence, adjudication):
     error_stop = any(Fraction(errors[s], len(valid)) > ERROR_STOP_SHARE for s in SUITES) if valid else False
     upper = denominator | set(indeterminate)
     numbers = dict(
-        mutants_scored=ratio(len(records), len(selected)), validity=validity, primary_denominator=len(denominator),
+        mutants_scored=ratio(len(records), len(selected)), result_identity_gaps=gaps, validity=validity,
+        primary_denominator=len(denominator),
         kill_rate={s: ratio(len(kills[s] & denominator), len(denominator)) for s in SUITES},
         two_by_two={"both": len(kills["witness"] & kills["upstream"]),
                     "witness_only": len(kills["witness"] - kills["upstream"]),
@@ -130,7 +140,7 @@ def assess_mutation(evidence, adjudication):
         outcome_classes=by_class, equivalent=len(equivalent), indeterminate=len(indeterminate),
         unadjudicated=unadjudicated, unresolved_failure_classifications=unresolved_failures,
         persistent_error_stop_S5=error_stop)
-    if len(records) != len(selected) or unadjudicated or unresolved_failures or not denominator or error_stop:
+    if not selected or any(gaps.values()) or unadjudicated or unresolved_failures or not denominator or error_stop:
         return criterion("not evaluable", **numbers)
     met = rate["witness"] >= rate["upstream"] - MUTATION_MARGIN
     numbers["exceeds_upstream"] = rate["witness"] > rate["upstream"]
@@ -138,17 +148,18 @@ def assess_mutation(evidence, adjudication):
 
 
 def assess_challenges(evidence, adjudication):
-    results = {row["id"]: row for row in load(evidence, "challenges.jsonl")}
+    rows = load(evidence, "challenges.jsonl")
+    results = {row["id"]: row for row in rows}
     validity, disputes = verdicts(adjudication, "challenge-validity"), verdicts(adjudication, "control-dispute")
     valid = sorted(i for (i, _), v in validity.items() if v == "valid")
     regressions = [i for i in valid if i.startswith("R")][:REGRESSIONS_SCORED]
     reclassified = sorted(i for i in valid if i.startswith("N") and disputes.get((i, None)) == "behavior-changed")
     controls = [i for i in valid if i.startswith("N") and i not in reclassified]
-    missing = sorted(i for i in regressions + controls if i not in results)
+    gaps = identity_gaps(regressions + controls, [r for r in rows if r["id"] in set(regressions + controls)])
     flagged = lambda i: results[i]["suites"]["witness"]["class"] == "behavioral"
-    if missing:
-        c4 = criterion("not evaluable", missing_results=missing)
-        c5 = criterion("not evaluable", missing_results=missing)
+    if gaps["missing"] or gaps["duplicated"]:
+        c4 = criterion("not evaluable", result_identity_gaps=gaps)
+        c5 = criterion("not evaluable", result_identity_gaps=gaps)
         return c4, c5
     detected = [i for i in regressions if flagged(i)]
     c4 = criterion("not evaluable" if len(regressions) < REGRESSIONS_SCORED else
@@ -157,13 +168,16 @@ def assess_challenges(evidence, adjudication):
                    missed=[i for i in regressions if i not in detected],
                    upstream_detected=ratio(sum(results[i]["suites"]["upstream"]["class"] == "behavioral"
                                                for i in regressions), len(regressions)))
+    # A control only tests for false alarms if the baseline actually ran it to an outcome.
+    untested = sorted(i for i in controls if results[i]["suites"]["witness"]["class"] not in ("survived", "behavioral"))
     alarms = [i for i in controls if flagged(i)]
     undisputed = sorted(i for i in alarms if (i, None) not in disputes)
     # An indeterminate dispute counts against the baseline.
     false_alarms = [i for i in alarms if disputes.get((i, None)) in ("false-alarm", "indeterminate")]
-    status = ("not evaluable" if len(controls) < CONTROLS_REQUIRED or undisputed else
+    status = ("not evaluable" if len(controls) < CONTROLS_REQUIRED or undisputed or untested else
               "met" if len(false_alarms) <= FALSE_ALARMS_ALLOWED else "not met")
     c5 = criterion(status, valid_controls=len(controls), false_alarms=false_alarms, undisputed_flags=undisputed,
+                   untested_controls={i: results[i]["suites"]["witness"]["class"] for i in untested},
                    reclassified_as_regressions=reclassified)
     return c4, c5
 
