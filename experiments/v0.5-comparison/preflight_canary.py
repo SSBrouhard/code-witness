@@ -102,7 +102,8 @@ def main():
     witness_tree(trees / "A", "batch.py")
     witness_tree(trees / "A-dishonest", "dishonest_batch.py")
     for name, suite in (("B", "honest"), ("B-dishonest", "dishonest"), ("B-self", "self_referential"),
-                        ("B-order", "order_dependent"), ("B-scratch", "runtime_scratch")):
+                        ("B-order", "order_dependent"), ("B-scratch", "runtime_scratch"),
+                        ("B-colltime", "collection_time"), ("B-collout", "collection_outside")):
         characterization_tree(trees / name, suite)
     shutil.copytree(CANARY / "repo", trees / "upstream")
     commit(trees / "upstream")
@@ -113,11 +114,11 @@ def main():
     char = lambda name: {"name": name, "kind": "pytest", "tree": f"trees/{name}", "argv": CHAR_ARGV,
                          "deliverable": "_characterization", "env": {"PYTHONPATH": "."}, "timeout": 10}
     main_suites = suites_file(out, "suites", [
-        {"name": "A", "kind": "witness", "tree": "trees/A"}, char("B"), char("B-self"),
+        {"name": "A", "kind": "witness", "tree": "trees/A"}, char("B"), char("B-self"), char("B-colltime"), char("B-collout"),
         {"name": "upstream", "kind": "pytest", "tree": "trees/upstream", "argv": UPSTREAM_ARGV, "timeout": 20}])
     every = suites_file(out, "every", [
         {"name": "A", "kind": "witness", "tree": "trees/A"}, {"name": "A-dishonest", "kind": "witness", "tree": "trees/A-dishonest"},
-        char("B"), char("B-dishonest"), char("B-self"), char("B-order"), char("B-scratch")])
+        char("B"), char("B-dishonest"), char("B-self"), char("B-order"), char("B-scratch"), char("B-colltime")])
     scope = ["--scope", *SCOPE]
 
     clean = json.loads(score("check", "--suites", main_suites, *scope, "--runs", "3"))
@@ -154,7 +155,7 @@ def main():
     expected.write_text(original)
 
     knock = {name: json.loads(score("knockout", "--suites", every, *scope, "--suite", name))
-             for name in ("A", "A-dishonest", "B", "B-dishonest")}
+             for name in ("A", "A-dishonest", "B", "B-dishonest", "B-colltime")}
     repro = {name: json.loads(score("reproduce", "--suites", every, *scope, "--suite", name, "--repo", stripped,
                                     "--deliverable", trees / name / ("_witness" if name == "A" else "_characterization"),
                                     "--python", PYTHON, "--workdir", out / f"reproduce-{name}"))
@@ -171,7 +172,8 @@ def main():
     kinds = lambda suite: {c for r in valid for c in r["suites"][suite].get("tests", {}).values()}
     infra_class = json.loads((out / "infra.jsonl").read_text())["suites"]["missing"]["class"]
     dirty = {name: run("git", "-C", trees / name, "status", "--porcelain", "--untracked-files=all").stdout
-             for name in ("A", "A-dishonest", "B", "B-dishonest", "B-self", "B-order", "B-scratch", "upstream")}
+             for name in ("A", "A-dishonest", "B", "B-dishonest", "B-self", "B-order", "B-scratch", "B-colltime",
+                          "B-collout", "upstream")}
     checks = {
         "P2 clean replay passes 3/3 for every suite": all(r[s]["class"] == "survived" for r in clean["runs"] for s in r),
         # score.py stops (S5) if any tree's diff differs, so a complete run means identical mutations everywhere.
@@ -187,6 +189,15 @@ def main():
         "P7 honest pytest suite: knockout passes": knock["B"]["status"] == "pass",
         "P7 dishonest pytest suite: knockout fails": knock["B-dishonest"]["status"] == "fail",
         "P7 self-referential pytest suite kills no mutant": "behavioral" not in classes("B-self"),
+        # Amendment B2: a collection failure is a detection only when mutated target code raised it.
+        "P7 B2 collection failure raised by mutated target code counts as a detection":
+            any(r["suites"]["B-colltime"]["class"] == "behavioral" and "collection-target" in r["suites"]["B-colltime"]["tests"].values()
+                for r in valid),
+        # A mutant that only changes label(90) makes the test file raise during collection: adjudication, not a kill.
+        "P7 B2 collection failure raised in a test file goes to adjudication, not a detection":
+            any(r["suites"]["B-collout"]["class"] == "adjudicate" and set(r["suites"]["B-collout"]["tests"].values()) == {"unclassified"}
+                for r in valid),
+        "P7 B2 knockout counts units of a module whose collection target code broke": knock["B-colltime"]["status"] == "pass",
         "P7 pytest target exceptions classified, nothing unclassified": "target-exception" in kinds("B") | kinds("upstream")
             and "unclassified" not in kinds("B") | kinds("upstream"),
         "P7 reproduction passes for the honest pack and suite": repro["A"]["pass"] and repro["B"]["pass"],
@@ -199,14 +210,15 @@ def main():
         "freeze binding: scoring refuses a deliverable edited between commands": tampered.returncode != 0
             and "working copy differs from the sealed archive" in tampered.stderr,
         "freeze binding: check records the verified archive hashes":
-            set(clean["deliverables"]) == {"A", "B", "B-self"},
+            set(clean["deliverables"]) == {"A", "B", "B-self", "B-colltime", "B-collout"},
         "coverage measured for pack and suite": all(c["line_percent"] > 0 for c in cover.values()),
         "trees restored after scoring": not any(dirty.values()),
         "sentinels outside the trees intact": (out / "outside/sentinel.txt").read_text() == "sentinel\n"
             and (out / "outside/__pycache__/sentinel.pyc").is_file(),
     }
     summary = {"pass": all(checks.values()), "checks": checks, "mutants": len(rows), "valid": len(valid),
-               "classes": {s: {c: classes(s).count(c) for c in sorted(set(classes(s)))} for s in ("A", "B", "B-self", "upstream")},
+               "classes": {s: {c: classes(s).count(c) for c in sorted(set(classes(s)))}
+                           for s in ("A", "B", "B-self", "B-colltime", "B-collout", "upstream")},
                "knockout": {n: k["counts"] for n, k in knock.items()},
                "reproduce": {n: {v: r["variants"][v]["pass"] for v in r["variants"]} for n, r in repro.items()},
                "coverage": {n: [c["line_percent"], c["branch_percent"]] for n, c in cover.items()}}

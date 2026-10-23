@@ -46,7 +46,9 @@ KNOCKOUT_THRESHOLD = 0.8
 FAILURE_ORIGIN = re.compile(r"^(?P<path>.+?):(?P<line>\d+): (?P<type>[A-Za-z_][\w.]*)$")
 ASSERTION_TYPES = {"AssertionError", "Failed"}  # Failed: pytest.raises/fail outcomes such as DID NOT RAISE
 DEPENDENCY_TYPES = {"ImportError", "ModuleNotFoundError"}
-KILL_CLASSES = ("assertion", "target-exception")
+# collection-target: a collection failure that amendment B2 accepts as caused by mutated target code.
+KILL_CLASSES = ("assertion", "target-exception", "collection-target")
+COLLECTED_FILE = re.compile(r"^(\S+\.py)(?:::|: \d+$)")
 INCIDENTAL_DIRS = {"__pycache__", ".pytest_cache"}
 INCIDENTAL_SUFFIXES = {".pyc", ".pyo"}
 ERROR_CLASSES = ("dependency", "collection", "setup")
@@ -216,8 +218,24 @@ def classify_failure(text, scope):
     return "unclassified"
 
 
+def collection_origin(text, scope):
+    """A collection error's traceback, read like a failure's: (kind, "path:line: Type").
+    kind is target (non-dependency exception located in target scope), outside (parseable non-dependency
+    exception located elsewhere), dependency, or unparseable."""
+    lines = (text or "").strip().splitlines()
+    origin = FAILURE_ORIGIN.match(lines[-1].strip()) if lines else None
+    if origin is None:
+        return "unparseable", None
+    kind = origin["type"].rsplit(".", 1)[-1]
+    location = f"{Path(origin['path']).as_posix()}:{origin['line']}: {kind}"
+    if kind in DEPENDENCY_TYPES:
+        return "dependency", location
+    return ("target" if Path(origin["path"]).as_posix() in scope else "outside"), location
+
+
 def junit_cases(root, scope):
-    """Every test item in a pytest junit report: passed, skipped, or its failure class."""
+    """Every test item in a pytest junit report: passed, skipped, or its failure class. A collection error
+    keeps the class "collection" here; classify_collection applies amendment B2 with the suite's evidence."""
     cases = {}
     for case in root.iter("testcase"):
         name = f"{case.get('classname')}::{case.get('name')}"
@@ -225,10 +243,59 @@ def junit_cases(root, scope):
         if failure is not None:
             cases[name] = {"class": classify_failure(failure.text, scope),
                            "knockout": KNOCKOUT_MARKER in (failure.text or "")}
+        elif error is not None and error.get("message") == "collection failure":
+            origin, location = collection_origin(error.text, scope)
+            # pytest reports a module's collection error with an empty classname and the module as its name.
+            cases[name] = {"class": "collection", "module": case.get("name") or case.get("classname"),
+                           "origin": origin, "location": location, "knockout": KNOCKOUT_MARKER in (error.text or "")}
         elif error is not None:
-            cases[name] = {"class": "collection" if error.get("message") == "collection failure" else "setup"}
+            cases[name] = {"class": "setup"}
         else:
             cases[name] = {"class": "skipped" if case.find("skipped") is not None else "passed"}
+    return cases
+
+
+def collected_modules(suite, cwd=None):
+    """Modules that collect without error on the tree as it is (the unchanged source, when called before
+    any mutation): dotted module names from pytest --collect-only node ids."""
+    argv = [*suite["argv"], "--collect-only"]
+    try:
+        done = subprocess.run(argv, cwd=cwd or suite["tree"], env={**os.environ, **suite["env"]}, capture_output=True,
+                              text=True, timeout=suite["timeout"])
+    except subprocess.TimeoutExpired:
+        return set()
+    if done.returncode != 0:
+        # Any collection error on the unchanged source: no module is trusted as collecting cleanly.
+        return set()
+    # Node ids ("path.py::test") at one -q, or "path.py: N" counts at -qq; both name the module's file.
+    files = {m.group(1) for m in map(COLLECTED_FILE.match, done.stdout.splitlines()) if m}
+    return {f.removesuffix(".py").replace("/", ".") for f in files}
+
+
+def classify_collection(cases, clean, rerun):
+    """Amendment B2. A collection error is a kill (collection-target) only when its module collected cleanly
+    on the unchanged source, its final traceback location is in target scope with a non-dependency exception,
+    and a rerun on the same tree reproduces the same module, type and location. A target-scope error that
+    does not reproduce, or a parseable non-dependency error located outside the target scope, goes to
+    adjudication (unclassified). Everything else stays an error (dependency or collection)."""
+    pending = {}
+    for name, case in cases.items():
+        if case["class"] != "collection":
+            continue
+        clean_module = case["module"] in (clean or set())
+        if case["origin"] == "dependency":
+            case["class"] = "dependency"
+        elif not clean_module or case["origin"] == "unparseable":
+            case["class"] = "collection"
+        elif case["origin"] == "outside":
+            case["class"] = "unclassified"
+        else:
+            pending[name] = case
+    if pending:
+        again = rerun()
+        seen = {(c.get("module"), c.get("location")) for c in (again or {}).values() if c.get("origin") == "target"}
+        for case in pending.values():
+            case["class"] = "collection-target" if (case["module"], case["location"]) in seen else "unclassified"
     return cases
 
 
@@ -246,10 +313,12 @@ def run_pytest(suite, scope, argv=None, env=None, cwd=None):
         return done.returncode, cases, (done.stdout + done.stderr)[-500:]
 
 
-def pytest_suite(suite, scope):
-    """junit classes: assertion and target-exception are kills; dependency, collection and setup
-    failures are errors; any other failure is unclassified and goes to adjudication."""
+def pytest_suite(suite, scope, clean=None):
+    """junit classes: assertion, target-exception and collection-target (amendment B2) are kills; dependency,
+    collection and setup failures are errors; any other failure is unclassified and goes to adjudication.
+    clean is the set of modules that collected without error on the unchanged source."""
     code, cases, tail = run_pytest(suite, scope)
+    classify_collection(cases, clean, lambda: run_pytest(suite, scope)[1])
     if code is None:
         return {"class": "timeout", "behavioral": [], "timeouts": [f"suite exceeded {suite['timeout']}s"],
                 "errors": [], "unclassified": [], "tests": {}}
@@ -289,7 +358,12 @@ def witness_suite(suite):
             "timeouts": timeouts, "errors": errors, "fixtures": len(data["rows"])}
 
 
-def run_suites(suites, scope):
+def clean_collections(suites):
+    """Collected modules per pytest suite, taken on the unchanged trees before anything is applied."""
+    return {s["name"]: collected_modules(s) for s in suites if s["kind"] == "pytest"}
+
+
+def run_suites(suites, scope, clean=None):
     """Run each suite on its own tree; an error result is rerun once before it is final."""
     results = {}
     for suite in suites:
@@ -297,7 +371,8 @@ def run_suites(suites, scope):
         for _ in range(2):
             start = time.monotonic()
             purge_bytecode(suite["tree"])
-            result = witness_suite(suite) if suite["kind"] == "witness" else pytest_suite(suite, scope)
+            result = witness_suite(suite) if suite["kind"] == "witness" else pytest_suite(
+                suite, scope, (clean or {}).get(suite["name"]))
             result["seconds"] = round(time.monotonic() - start, 3)
             attempts.append(result)
             if result["class"] != "error":
@@ -365,6 +440,9 @@ def run_mutants(args):
     suites = load_suites(args.suites)
     mutants = json.loads(Path(args.mutants).read_text())["selected"][args.start:args.stop]
     frozen = snapshot(suites)
+    for suite in suites:
+        require_clean(suite["tree"])
+    clean = clean_collections(suites)
     with open(args.out, "a") as out:
         for mutant in mutants:
             for suite in suites:
@@ -380,7 +458,7 @@ def run_mutants(args):
                 record = {**mutant, "diff_sha256": digest(diff), "diff": diff,
                           "validity": validity(args, suites[0]["tree"], diff)}
                 if record["validity"] == "valid":
-                    record["suites"] = run_suites(suites, set(args.scope))
+                    record["suites"] = run_suites(suites, set(args.scope), clean)
                     # Every suite must have observed byte-identical mutated source throughout.
                     if digest(identical_diff(suites, mutant["id"])) != record["diff_sha256"]:
                         raise SystemExit(f"S5: mutated source changed during scoring: {mutant['id']}")
@@ -397,11 +475,13 @@ def check_current(args):
     suites = load_suites(args.suites)
     diff = identical_diff(suites, "check")
     frozen = snapshot(suites)
+    clean = clean_collections(suites)
     runs = []
     for number in range(args.runs):
-        runs.append(run_suites(suites, set(args.scope)))
+        runs.append(run_suites(suites, set(args.scope), clean))
         require_frozen(suites, frozen, f"check run {number + 1}")
     print(json.dumps({"diff_sha256": digest(diff), "runs": runs,
+                      "collected_modules": {name: sorted(modules) for name, modules in clean.items()},
                       "deliverables": {s["name"]: s["archive_sha256"] for s in suites if s["deliverable"] is not None}},
                      indent=2))
 
@@ -410,6 +490,9 @@ def run_challenges(args):
     """Apply each challenge patch to every suite tree, score, restore, and record."""
     suites = load_suites(args.suites)
     frozen = snapshot(suites)
+    for suite in suites:
+        require_clean(suite["tree"])
+    clean = clean_collections(suites)
     with open(args.out, "a") as out:
         for challenge in args.ids:
             patch = Path(args.dir, f"{challenge}.patch").resolve()
@@ -421,7 +504,7 @@ def run_challenges(args):
                                    capture_output=True)
                 diff = identical_diff(suites, challenge)
                 record = {"id": challenge, "kind": "regression" if challenge.startswith("R") else "control",
-                          "diff_sha256": digest(diff), "suites": run_suites(suites, set(args.scope))}
+                          "diff_sha256": digest(diff), "suites": run_suites(suites, set(args.scope), clean)}
                 if digest(identical_diff(suites, challenge)) != record["diff_sha256"]:
                     raise SystemExit(f"S5: challenge source changed during scoring: {challenge}")
             finally:
@@ -459,11 +542,15 @@ def pytest_knockout_cases(clean_cases, knocked_cases, timed_out):
     units = sorted(name for name, case in clean_cases.items() if case["class"] == "passed")
     cases = {"changed": [], "unchanged": [], "blocked": [], "errored": []}
     reached = []
+    # A module that failed to collect under knockout stands for every unit in it (amendment B2).
+    collection = {c["module"]: c for c in knocked_cases.values() if c.get("module")}
     for name in units:
         if timed_out:
             cases["blocked"].append(name)
             continue
-        case = knocked_cases.get(name)
+        classname = name.split("::", 1)[0]
+        module = next((m for m in collection if classname == m or classname.startswith(m + ".")), None)
+        case = knocked_cases.get(name) or (collection[module] if module else None)
         if case is None or case["class"] not in ("passed", *KILL_CLASSES):
             cases["errored"].append(name)
         elif case["class"] == "passed":
@@ -511,6 +598,7 @@ def knockout(args):
     if suite["kind"] == "pytest":
         purge_bytecode(tree)
         _, clean_cases, _ = run_pytest(suite, scope)
+        clean = collected_modules(suite)
     for name in args.scope:
         path = tree / name
         path.write_text(ast.unparse(ast.fix_missing_locations(Knockout().visit(ast.parse(path.read_text())))) + "\n")
@@ -520,6 +608,7 @@ def knockout(args):
         else:
             purge_bytecode(tree)
             code, knocked, _ = run_pytest(suite, scope)
+            classify_collection(knocked, clean, lambda: run_pytest(suite, scope)[1])
             units, cases, reached = pytest_knockout_cases(clean_cases, knocked, code is None)
     finally:
         restore(tree)

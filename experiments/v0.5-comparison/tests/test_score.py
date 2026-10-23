@@ -99,6 +99,79 @@ class Classification(unittest.TestCase):
                          {"t::passes": "passed", "t::skips": "skipped", "t::fails": "unclassified", "t::": "collection"})
 
 
+class CollectionClassification(unittest.TestCase):
+    """Amendment B2: a collection failure is a detection only when mutated target code demonstrably caused it."""
+
+    def junit(self, last_line, module="test.test_core", message="collection failure"):
+        root = ET.fromstring(f'<testsuites><testsuite><testcase classname="" name="{module}">'
+                             f'<error message="{message}">{failure(last_line)}</error></testcase></testsuite></testsuites>')
+        return score.junit_cases(root, SCOPE)
+
+    def classify(self, last_line, clean=frozenset({"test.test_core"}), rerun_line=None, module="test.test_core"):
+        cases = self.junit(last_line, module)
+        again = self.junit(rerun_line or last_line, module)
+        calls = []
+        score.classify_collection(cases, set(clean), lambda: calls.append(1) or again)
+        return next(iter(cases.values()))["class"], len(calls)
+
+    def test_reproducible_target_scope_exception_after_clean_collection_is_a_detection(self):
+        self.assertEqual(self.classify("canary/core.py:5: ValueError"), ("collection-target", 1))
+        self.assertIn("collection-target", score.KILL_CLASSES)
+
+    def test_dependency_failures_stay_errors_even_in_target_scope(self):
+        self.assertEqual(self.classify("canary/core.py:1: ModuleNotFoundError"), ("dependency", 0))
+        self.assertEqual(self.classify("vendor/x.py:3: ImportError"), ("dependency", 0))
+
+    def test_module_that_did_not_collect_cleanly_on_unchanged_source_stays_an_error(self):
+        self.assertEqual(self.classify("canary/core.py:5: ValueError", clean=set()), ("collection", 0))
+        self.assertEqual(self.classify("canary/core.py:5: ValueError", clean={"test.test_other"}), ("collection", 0))
+
+    def test_unparseable_traceback_stays_an_error(self):
+        cases = score.junit_cases(ET.fromstring(
+            '<testsuites><testsuite><testcase classname="" name="test.test_core">'
+            '<error message="collection failure">ERROR: file or directory not found: tests</error>'
+            '</testcase></testsuite></testsuites>'), SCOPE)
+        score.classify_collection(cases, {"test.test_core"}, lambda: self.fail("no rerun for an unparseable error"))
+        self.assertEqual(next(iter(cases.values()))["class"], "collection")
+
+    def test_exception_raised_outside_target_scope_goes_to_adjudication(self):
+        for location in ("tests/test_core.py:7: RuntimeError", "/usr/lib/python3.13/json/decoder.py:9: JSONDecodeError",
+                         "/venv/lib/python3.13/site-packages/_pytest/python.py:5: TypeError"):
+            self.assertEqual(self.classify(location), ("unclassified", 0), location)
+
+    def test_target_exception_that_does_not_reproduce_goes_to_adjudication(self):
+        self.assertEqual(self.classify("canary/core.py:5: ValueError", rerun_line="canary/core.py:9: ValueError"),
+                         ("unclassified", 1))
+        self.assertEqual(self.classify("canary/core.py:5: ValueError", rerun_line="tests/test_core.py:2: KeyError"),
+                         ("unclassified", 1))
+
+    def test_setup_errors_and_failures_are_unchanged(self):
+        root = ET.fromstring('<testsuites><testsuite><testcase classname="t" name="a">'
+                             '<error message="failed on setup">canary/core.py:5: ValueError</error></testcase>'
+                             '</testsuite></testsuites>')
+        self.assertEqual(score.junit_cases(root, SCOPE)["t::a"]["class"], "setup")
+
+    def test_collection_target_counts_as_behavioral_in_a_suite_result(self):
+        cases = self.junit("canary/core.py:5: ValueError")
+        score.classify_collection(cases, {"test.test_core"}, lambda: self.junit("canary/core.py:5: ValueError"))
+        tests = {t: c["class"] for t, c in cases.items()}
+        self.assertEqual(score.classify(sorted(t for t, c in tests.items() if c in score.KILL_CLASSES), [], []),
+                         "behavioral")
+
+    def test_knockout_maps_a_module_collection_failure_to_its_units(self):
+        clean = {"test.test_core::test_a": {"class": "passed"}, "test.test_core.TestX::test_b": {"class": "passed"},
+                 "test.test_other::test_c": {"class": "passed"}}
+        knocked = {"::test.test_core": {"class": "collection-target", "module": "test.test_core", "knockout": True},
+                   "test.test_other::test_c": {"class": "passed"}}
+        _, cases, reached = score.pytest_knockout_cases(clean, knocked, False)
+        self.assertEqual(cases["changed"], ["test.test_core.TestX::test_b", "test.test_core::test_a"])
+        self.assertEqual(cases["unchanged"], ["test.test_other::test_c"])
+        self.assertEqual(len(reached), 2)
+        knocked["::test.test_core"]["class"] = "unclassified"
+        _, cases, _ = score.pytest_knockout_cases(clean, knocked, False)
+        self.assertEqual(len(cases["errored"]), 2)
+
+
 class KnockoutUnits(unittest.TestCase):
     clean = {"t::a": {"class": "passed"}, "t::b": {"class": "passed"}, "t::c": {"class": "passed"},
              "t::d": {"class": "passed"}, "t::skip": {"class": "skipped"}}
@@ -251,6 +324,38 @@ class PytestSuites(unittest.TestCase):
                 call("check", "--suites", declared, "--scope", *SCOPE)
             self.assertIn("working copy differs from the sealed archive", str(stopped.exception))
             self.assertIn("tests/expected.json", str(stopped.exception))
+
+    def test_collection_failures_are_classified_by_where_they_were_raised(self):
+        suites = self.suites(self.char("T", "collection_time"), self.char("O", "collection_outside"))
+        patches = self.tmp / "patches"
+        patches.mkdir()
+        core = self.tmp / "T/canary/core.py"
+        original = core.read_text()
+        # R01: score() raises for positive points, so code under test raises while pytest collects.
+        # R02: label(90) only returns a different value, so the collection-outside test file raises itself.
+        for cid, edit in (("R01", ("points < 0", "points > 0")), ("R02", ("total >= 90", "total >= 95"))):
+            core.write_text(original.replace(*edit))
+            (patches / f"{cid}.patch").write_text(subprocess.run(["git", "-C", str(self.tmp / "T"), "diff"],
+                                                                 capture_output=True, text=True, check=True).stdout)
+            core.write_text(original)
+        out = self.tmp / "challenges.jsonl"
+        call("challenges", "--suites", suites, "--scope", *SCOPE, "--dir", patches, "--ids", "R01", "R02", "--out", out)
+        r01, r02 = [json.loads(line)["suites"] for line in out.read_text().splitlines()]
+        for name in ("T", "O"):  # raised by target code during collection: a detection in both suites
+            self.assertEqual((r01[name]["class"], set(r01[name]["tests"].values())), ("behavioral", {"collection-target"}))
+        self.assertEqual((r02["T"]["class"], set(r02["T"]["tests"].values())), ("behavioral", {"assertion"}))
+        # raised by the test file itself: adjudication, never a detection on its own
+        self.assertEqual((r02["O"]["class"], set(r02["O"]["tests"].values())), ("adjudicate", {"unclassified"}))
+
+    def test_collection_failure_on_unchanged_source_is_never_a_detection(self):
+        entry = self.char("U", "collection_time")
+        core = self.tmp / "U/canary/core.py"
+        core.write_text(core.read_text().replace("points < 0", "points > 0"))
+        subprocess.run(["git", "-C", str(self.tmp / "U"), "-c", "user.name=t", "-c", "user.email=t@localhost",
+                        "commit", "-qam", "broken at base"], check=True, capture_output=True)
+        result = call("check", "--suites", self.suites(entry), "--scope", *SCOPE)
+        self.assertEqual(result["collected_modules"], {"U": []})
+        self.assertEqual(result["runs"][0]["U"]["class"], "error")
 
     def test_pytest_knockout_detects_a_dishonest_suite(self):
         suites = self.suites(self.char("B", "honest"), self.char("D", "dishonest"))
