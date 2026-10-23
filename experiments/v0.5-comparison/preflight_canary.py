@@ -4,12 +4,14 @@ Usage: PYTHON preflight_canary.py OUTPUT_DIR
 PYTHON is an environment with the pinned debt-compiler wheel, cosmic-ray, coverage and pytest.
 OUTPUT_DIR must not exist. Exits nonzero if any expectation fails. No command runs through a shell.
 """
+import hashlib
 import json
 import os
 from pathlib import Path
 import shutil
 import subprocess
 import sys
+import tarfile
 
 HERE = Path(__file__).resolve().parent
 CANARY = HERE / "canary"
@@ -62,9 +64,24 @@ def characterization_tree(path, suite, decoys=True):
     return path
 
 
+def seal(out, suite):
+    """Seal a suite's deliverable into an archive, as the coordinator's freeze does, and declare it."""
+    name = suite.get("deliverable") or ("_witness" if suite["kind"] == "witness" else None)
+    if name is None or "archive" in suite:
+        return suite
+    source, archive = out / suite["tree"] / name, out / "sealed" / f"{suite['name']}.tar"
+    archive.parent.mkdir(exist_ok=True)
+    with tarfile.open(archive, "w") as tar:
+        for path in sorted(source.rglob("*")):
+            if "__pycache__" not in path.parts:
+                tar.add(path, arcname=path.relative_to(source).as_posix(), recursive=False)
+    return {**suite, "archive": f"sealed/{suite['name']}.tar",
+            "archive_sha256": hashlib.sha256(archive.read_bytes()).hexdigest()}
+
+
 def suites_file(out, name, suites):
     path = out / f"{name}.json"
-    path.write_text(json.dumps(suites, indent=2) + "\n")
+    path.write_text(json.dumps([seal(out, s) for s in suites], indent=2) + "\n")
     return path
 
 
@@ -74,6 +91,9 @@ def main():
         raise SystemExit(f"Refusing existing output directory: {out}")
     trees = out / "trees"
     trees.mkdir(parents=True)
+    # The scoring sandbox's writable scratch location, as in the protocol; runtime files go here.
+    (out / "tmp").mkdir()
+    os.environ["TMPDIR"] = str(out / "tmp")
     # Sentinels outside the trees must survive every scoring step.
     (out / "outside/__pycache__").mkdir(parents=True)
     (out / "outside/sentinel.txt").write_text("sentinel\n")
@@ -82,7 +102,7 @@ def main():
     witness_tree(trees / "A", "batch.py")
     witness_tree(trees / "A-dishonest", "dishonest_batch.py")
     for name, suite in (("B", "honest"), ("B-dishonest", "dishonest"), ("B-self", "self_referential"),
-                        ("B-order", "order_dependent")):
+                        ("B-order", "order_dependent"), ("B-scratch", "runtime_scratch")):
         characterization_tree(trees / name, suite)
     shutil.copytree(CANARY / "repo", trees / "upstream")
     commit(trees / "upstream")
@@ -97,7 +117,7 @@ def main():
         {"name": "upstream", "kind": "pytest", "tree": "trees/upstream", "argv": UPSTREAM_ARGV, "timeout": 20}])
     every = suites_file(out, "every", [
         {"name": "A", "kind": "witness", "tree": "trees/A"}, {"name": "A-dishonest", "kind": "witness", "tree": "trees/A-dishonest"},
-        char("B"), char("B-dishonest"), char("B-self"), char("B-order")])
+        char("B"), char("B-dishonest"), char("B-self"), char("B-order"), char("B-scratch")])
     scope = ["--scope", *SCOPE]
 
     clean = json.loads(score("check", "--suites", main_suites, *scope, "--runs", "3"))
@@ -123,6 +143,16 @@ def main():
         stale[name] = json.loads(score("check", "--suites", one, *scope))["runs"][0][name]["class"]
         run("git", "-C", tree, "checkout", "-q", "--", ".")
 
+    scratch = json.loads(score("check", "--suites", suites_file(out, "scratch", [char("B-scratch")]), *scope,
+                               "--runs", "3"))
+    scratch_files = sorted(p.name for p in (out / "tmp").rglob("*.log"))
+    # Tampering between commands: an edited expectation must be refused when the next command starts.
+    expected = trees / "B/_characterization/tests/expected.json"
+    original = expected.read_text()
+    expected.write_text(original.replace('"high"', '"mid"', 1))
+    tampered = run(PYTHON, HERE / "score.py", "check", "--suites", main_suites, *scope, check=False)
+    expected.write_text(original)
+
     knock = {name: json.loads(score("knockout", "--suites", every, *scope, "--suite", name))
              for name in ("A", "A-dishonest", "B", "B-dishonest")}
     repro = {name: json.loads(score("reproduce", "--suites", every, *scope, "--suite", name, "--repo", stripped,
@@ -141,7 +171,7 @@ def main():
     kinds = lambda suite: {c for r in valid for c in r["suites"][suite].get("tests", {}).values()}
     infra_class = json.loads((out / "infra.jsonl").read_text())["suites"]["missing"]["class"]
     dirty = {name: run("git", "-C", trees / name, "status", "--porcelain", "--untracked-files=all").stdout
-             for name in ("A", "A-dishonest", "B", "B-dishonest", "B-self", "B-order", "upstream")}
+             for name in ("A", "A-dishonest", "B", "B-dishonest", "B-self", "B-order", "B-scratch", "upstream")}
     checks = {
         "P2 clean replay passes 3/3 for every suite": all(r[s]["class"] == "survived" for r in clean["runs"] for s in r),
         # score.py stops (S5) if any tree's diff differs, so a complete run means identical mutations everywhere.
@@ -164,6 +194,12 @@ def main():
             and repro["B-order"]["variants"]["hashseed-0"]["pass"] and not repro["B-order"]["variants"]["reverse-order"]["pass"],
         "P7 decoy conftest.py and pytest.ini have no effect with the fixed command": clean["runs"][0]["B"]["items"] == 12,
         "P7 decoys are live without the fixed command": unguarded.returncode != 0,
+        "runtime scratch: a suite writing under TMPDIR passes 3/3 with its deliverable unchanged":
+            all(r["B-scratch"]["class"] == "survived" for r in scratch["runs"]) and len(scratch_files) == 36,
+        "freeze binding: scoring refuses a deliverable edited between commands": tampered.returncode != 0
+            and "working copy differs from the sealed archive" in tampered.stderr,
+        "freeze binding: check records the verified archive hashes":
+            set(clean["deliverables"]) == {"A", "B", "B-self"},
         "coverage measured for pack and suite": all(c["line_percent"] > 0 for c in cover.values()),
         "trees restored after scoring": not any(dirty.values()),
         "sentinels outside the trees intact": (out / "outside/sentinel.txt").read_text() == "sentinel\n"

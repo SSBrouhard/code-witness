@@ -6,7 +6,8 @@ fixed-name files in one evidence directory and never an agent's narrative:
 
 Evidence files:
   PREFLIGHT.json, LABELS.json ({"W": "A1", "X": "B2", ...}), INCIDENTS.jsonl, ADJUDICATION.jsonl,
-  FREEZE-<label>.json with baseline-<label>.tar, clean.json, mutants.json, mutants.jsonl,
+  FREEZE-<label>.json with baseline-<label>.tar, clean.json (with the archive hash the scorer verified for
+  each run's deliverable), mutants.json, mutants.jsonl,
   challenges.jsonl, knockout-<label>.json, reproduce-<label>.json
 """
 import argparse
@@ -147,11 +148,16 @@ def check_validity(evidence, labels):
         else:
             frozen[label] = tar.is_file() and hashlib.sha256(tar.read_bytes()).hexdigest() == freeze["baseline_tar_sha256"]
     names = sorted((labels or {}).values())
-    return {"V1": bool(preflight and preflight.get("pass")) and all(frozen.values()),
+    # The scorer binds each working copy to the archive hash it was given; that hash must be the frozen one.
+    scored = (load(evidence, "clean.json") or {}).get("deliverables", {})
+    bound = {label: scored.get(label) == (load(evidence, f"FREEZE-{label}.json") or {}).get("baseline_tar_sha256")
+             for label in LABELS}
+    return {"V1": bool(preflight and preflight.get("pass")) and all(frozen.values()) and all(bound.values()),
             "V2": not INVALIDATING_STOPS & set(stops),
             "V3": sorted(labels or {}) == list(LABELS) and names == sorted(RUN_NAMES)
                   and all(Path(evidence, f"FREEZE-{label}.json").is_file() for label in LABELS),
             "details": {"preflight_pass": bool(preflight and preflight.get("pass")), "frozen": frozen,
+                        "scored_archives_match_freeze": bound,
                         "stop_conditions": stops, "labels": labels}}
 
 

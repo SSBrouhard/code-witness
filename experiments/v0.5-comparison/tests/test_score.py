@@ -1,5 +1,6 @@
 """Tests for the v0.5 scorer (not engine tests). The full canary flow is preflight_canary.py."""
 import contextlib
+import hashlib
 import importlib.util
 import io
 import json
@@ -7,6 +8,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
+import tarfile
 import tempfile
 import unittest
 import xml.etree.ElementTree as ET
@@ -42,6 +44,22 @@ def git_tree(path, suite=None, decoys=False):
     if suite:
         shutil.copytree(HERE / "canary/characterization" / suite, path / "_characterization")
     return path
+
+
+def sealed(root, entries):
+    """Seal each deliverable into an archive, as the coordinator's freeze does, and declare it."""
+    (root / "sealed").mkdir(exist_ok=True)
+    for entry in entries:
+        name = entry.get("deliverable") or ("_witness" if entry["kind"] == "witness" else None)
+        if name is None:
+            continue
+        source, archive = root / entry["tree"] / name, root / "sealed" / f"{entry['name']}.tar"
+        with tarfile.open(archive, "w") as tar:
+            for path in sorted(source.rglob("*")):
+                if "__pycache__" not in path.parts:
+                    tar.add(path, arcname=path.relative_to(source).as_posix(), recursive=False)
+        entry.update(archive=f"sealed/{entry['name']}.tar", archive_sha256=hashlib.sha256(archive.read_bytes()).hexdigest())
+    return list(entries)
 
 
 def call(*argv):
@@ -121,18 +139,24 @@ class Suites(unittest.TestCase):
         return path
 
     def test_declarations_resolve_relative_to_the_file(self):
-        path = self.write([{"name": "W", "kind": "witness", "tree": "trees/W"},
+        path = self.write([{"name": "W", "kind": "witness", "tree": "trees/W", "archive": "sealed/W.tar",
+                            "archive_sha256": "0" * 64},
                            {"name": "X", "kind": "pytest", "tree": "trees/X", "argv": CHAR_ARGV}])
         w, x = score.load_suites(path)
         root = path.resolve().parent
         self.assertEqual(w["pack"], root / "trees/W/_witness/pack")
+        self.assertEqual(w["archive"], root / "sealed/W.tar")
+        self.assertIsNone(x["deliverable"])
         self.assertEqual((x["tree"], x["timeout"], x["env"]), (root / "trees/X", 300.0, {}))
 
     def test_invalid_declarations_are_refused(self):
         bad = ([{"name": "W", "kind": "witness", "tree": "t"}, {"name": "W", "kind": "witness", "tree": "u"}],
                [{"name": "W", "kind": "witness", "tree": "t"}, {"name": "X", "kind": "witness", "tree": "t"}],
                [{"name": "X", "kind": "pytest", "tree": "t", "argv": ["python", "tests"]}],
-               [{"name": "X", "kind": "shell", "tree": "t"}], [])
+               [{"name": "X", "kind": "shell", "tree": "t"}], [],
+               [{"name": "W", "kind": "witness", "tree": "t"}],  # a deliverable without its sealed archive
+               [{"name": "X", "kind": "pytest", "tree": "t", "argv": CHAR_ARGV, "deliverable": "_characterization",
+                 "archive": "sealed/X.tar"}])
         for suites in bad:
             with self.assertRaises(SystemExit, msg=suites):
                 score.load_suites(self.write(suites))
@@ -144,9 +168,9 @@ class PytestSuites(unittest.TestCase):
         self.tmp = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, self.tmp)
 
-    def suites(self, *entries):
-        path = self.tmp / "suites.json"
-        path.write_text(json.dumps(list(entries)))
+    def suites(self, *entries, name="suites.json"):
+        path = self.tmp / name
+        path.write_text(json.dumps(sealed(self.tmp, entries)))
         return path
 
     def char(self, name, suite, decoys=True):
@@ -210,6 +234,24 @@ class PytestSuites(unittest.TestCase):
         self.assertEqual(result["runs"][0]["P"]["class"], "survived")
         self.assertIn("P", result["deliverables"])
 
+    def test_tampering_between_commands_and_in_a_shard_copy_is_refused(self):
+        suites = self.suites(self.char("B", "honest"))
+        self.assertEqual(call("check", "--suites", suites, "--scope", *SCOPE)["deliverables"],
+                         {"B": json.loads(suites.read_text())[0]["archive_sha256"]})
+        # A parallel shard: a copy of the tree with an edited expectation, declared against the same archive.
+        shutil.copytree(self.tmp / "B", self.tmp / "B-shard")
+        expected = self.tmp / "B-shard/_characterization/tests/expected.json"
+        expected.write_text(expected.read_text().replace('"high"', '"mid"', 1))
+        shard = self.tmp / "shard.json"
+        shard.write_text(json.dumps([{**json.loads(suites.read_text())[0], "tree": "B-shard"}]))
+        for declared in (shard, suites):
+            if declared is suites:  # The same edit to the original tree after a completed command.
+                shutil.copy(expected, self.tmp / "B/_characterization/tests/expected.json")
+            with self.assertRaises(SystemExit) as stopped:
+                call("check", "--suites", declared, "--scope", *SCOPE)
+            self.assertIn("working copy differs from the sealed archive", str(stopped.exception))
+            self.assertIn("tests/expected.json", str(stopped.exception))
+
     def test_pytest_knockout_detects_a_dishonest_suite(self):
         suites = self.suites(self.char("B", "honest"), self.char("D", "dishonest"))
         self.assertEqual(call("knockout", "--suites", suites, "--scope", *SCOPE, "--suite", "B")["status"], "pass")
@@ -241,7 +283,8 @@ class DeliverableFingerprint(unittest.TestCase):
         (self.deliverable / "pack/tests").mkdir(parents=True)
         (self.deliverable / "pack/tests/observations.json").write_text("{}")
         (self.deliverable / "BASELINE.md").write_text("baseline")
-        (self.tmp / "suites.json").write_text(json.dumps([{"name": "W", "kind": "witness", "tree": "tree"}]))
+        (self.tmp / "suites.json").write_text(json.dumps(sealed(self.tmp, [{"name": "W", "kind": "witness",
+                                                                             "tree": "tree"}])))
         self.suites = score.load_suites(self.tmp / "suites.json")
         self.frozen = score.snapshot(self.suites)
 
@@ -254,6 +297,22 @@ class DeliverableFingerprint(unittest.TestCase):
             (self.deliverable / cache).parent.mkdir(parents=True, exist_ok=True)
             (self.deliverable / cache).write_text("cache")
         score.require_frozen(self.suites, self.frozen, "caches")
+
+    def test_working_copy_must_match_the_sealed_archive_at_every_start(self):
+        """Tampering between commands is caught when the next command starts, not only during one."""
+        (self.deliverable / "pack/tests/observations.json").write_text('{"rows": []}')
+        with self.assertRaises(SystemExit) as stopped:
+            score.snapshot(score.load_suites(self.tmp / "suites.json"))
+        self.assertIn("W: working copy differs from the sealed archive", str(stopped.exception))
+        self.assertIn("pack/tests/observations.json", str(stopped.exception))
+
+    def test_archive_must_match_its_sealed_hash(self):
+        with tarfile.open(self.tmp / "sealed/W.tar", "a") as tar:
+            info = tarfile.TarInfo("EXTRA.md")
+            tar.addfile(info, io.BytesIO(b""))
+        with self.assertRaises(SystemExit) as stopped:
+            score.snapshot(score.load_suites(self.tmp / "suites.json"))
+        self.assertIn("archive does not match its sealed hash", str(stopped.exception))
 
     def test_changed_added_and_removed_files_stop_scoring(self):
         edits = (lambda: (self.deliverable / "pack/tests/observations.json").write_text('{"rows": []}'),
@@ -278,11 +337,11 @@ class MutantsAcrossTrees(unittest.TestCase):
         for name in ("B", "B2"):
             git_tree(tmp / name, "honest", decoys=True)
         git_tree(tmp / "upstream")
-        (tmp / "suites.json").write_text(json.dumps([
+        (tmp / "suites.json").write_text(json.dumps(sealed(tmp, [
             {"name": n, "kind": "pytest", "tree": n, "argv": CHAR_ARGV, "env": {"PYTHONPATH": "."}, "timeout": 10,
              "deliverable": "_characterization"}
             for n in ("B", "B2")] + [{"name": "upstream", "kind": "pytest", "tree": "upstream", "timeout": 10,
-                                      "argv": [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", "tests"]}]))
+                                      "argv": [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", "tests"]}])))
         call("mutants", "--tree", tmp / "upstream", "--scope", *SCOPE, "--seed", "1", "--cap", "6",
              "--out", tmp / "mutants.json")
         call("run", "--suites", tmp / "suites.json", "--scope", *SCOPE, "--mutants", tmp / "mutants.json",

@@ -3,11 +3,13 @@
 Deterministic support for docs/v0.5-comparison-protocol.md. Not part of debt-compiler.
 No command here runs through a shell; cosmic-ray is used only to enumerate and apply mutants.
 
-Suites are declared in a JSON file. Relative trees resolve against that file's directory; pack,
-adapter, cases and deliverable resolve against the suite's own tree. A deliverable (default _witness/ for
-witness suites; declared for pytest suites) is fingerprinted, and any change to it stops scoring:
-  [{"name": "W", "kind": "witness", "tree": "trees/W", "pack": "_witness/pack"},
+Suites are declared in a JSON file. Relative trees and archives resolve against that file's directory;
+pack, adapter, cases and deliverable resolve against the suite's own tree. A deliverable (default _witness/
+for witness suites; declared for pytest suites) must match its sealed baseline archive, whose SHA-256 must
+match the hash recorded at freeze, at the start and after every scored item; any difference stops scoring:
+  [{"name": "W", "kind": "witness", "tree": "trees/W", "archive": "sealed/baseline-W.tar", "archive_sha256": "..."},
    {"name": "X", "kind": "pytest", "tree": "trees/X", "deliverable": "_characterization", "timeout": 60,
+    "archive": "sealed/baseline-X.tar", "archive_sha256": "...",
     "env": {"PYTHONPATH": "."},
     "argv": ["/abs/python", "-m", "pytest", "-q", "-p", "no:cacheprovider", "-c", "_characterization/pytest.ini",
              "--rootdir=_characterization", "--confcutdir=_characterization", "_characterization/tests"]},
@@ -24,6 +26,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tarfile
 import tempfile
 import time
 import xml.etree.ElementTree as ET
@@ -80,16 +83,20 @@ def digest(text):
     return hashlib.sha256(text.encode()).hexdigest()
 
 
+def incidental(relative, is_file):
+    parts = relative.parts[:-1] if is_file else relative.parts
+    return bool(INCIDENTAL_DIRS & set(parts)) or relative.suffix in INCIDENTAL_SUFFIXES
+
+
 def fingerprint(directory):
-    """SHA-256 of every file in a frozen deliverable, by relative path. Deliverables are excluded from
-    git, so this is what shows they did not change. Python caches are incidental and ignored."""
+    """SHA-256 of every file in a deliverable working copy, by relative path. Deliverables are excluded
+    from git, so this is what shows they match the sealed archive. Python caches are ignored."""
     if directory is None or not directory.is_dir():
         return None
     files = {}
     for path in sorted(directory.rglob("*")):
         relative = path.relative_to(directory)
-        if INCIDENTAL_DIRS & set(relative.parts[:-1] if path.is_file() else relative.parts) \
-                or path.suffix in INCIDENTAL_SUFFIXES:
+        if incidental(relative, path.is_file()):
             continue
         if path.is_symlink():
             files[relative.as_posix()] = "symlink:" + os.readlink(path)
@@ -98,19 +105,48 @@ def fingerprint(directory):
     return files
 
 
+def archive_fingerprint(archive):
+    """The same fingerprint, read from a sealed baseline archive (members relative to the deliverable)."""
+    files = {}
+    with tarfile.open(archive) as sealed:
+        for member in sealed.getmembers():
+            relative = Path(member.name.removeprefix("./"))
+            if member.isdir() or incidental(relative, True):
+                continue
+            if member.issym():
+                files[relative.as_posix()] = "symlink:" + member.linkname
+            elif member.isfile():
+                files[relative.as_posix()] = hashlib.sha256(sealed.extractfile(member).read()).hexdigest()
+    return files
+
+
+def differences(expected, actual):
+    expected, actual = expected or {}, actual or {}
+    return sorted(f for f in set(expected) | set(actual) if expected.get(f) != actual.get(f)) or ["<missing>"]
+
+
 def snapshot(suites):
-    return {s["name"]: fingerprint(s["deliverable"]) for s in suites if s["deliverable"] is not None}
+    """The sealed fingerprint of every deliverable. Each archive must match its sealed hash, and each
+    working copy must match its archive, before any result can count (S5 otherwise)."""
+    sealed = {}
+    for suite in suites:
+        if suite["deliverable"] is None:
+            continue
+        if hashlib.sha256(suite["archive"].read_bytes()).hexdigest() != suite["archive_sha256"]:
+            raise SystemExit(f"S5: {suite['name']}: archive does not match its sealed hash: {suite['archive']}")
+        sealed[suite["name"]] = archive_fingerprint(suite["archive"])
+        working = fingerprint(suite["deliverable"])
+        if working != sealed[suite["name"]]:
+            raise SystemExit(f"S5: {suite['name']}: working copy differs from the sealed archive: "
+                             + json.dumps(differences(sealed[suite["name"]], working)))
+    return sealed
 
 
 def require_frozen(suites, expected, label):
-    """Stop (S5) if any frozen deliverable gained, lost or changed a file since scoring started."""
-    current = snapshot(suites)
-    changed = {}
-    for name, before in expected.items():
-        after = current.get(name)
-        if after != before:
-            before, after = before or {}, after or {}
-            changed[name] = sorted(f for f in set(before) | set(after) if before.get(f) != after.get(f)) or ["<missing>"]
+    """Stop (S5) if any deliverable no longer matches its sealed archive."""
+    current = {s["name"]: fingerprint(s["deliverable"]) for s in suites if s["deliverable"] is not None}
+    changed = {name: differences(files, current.get(name)) for name, files in expected.items()
+               if current.get(name) != files}
     if changed:
         raise SystemExit(f"S5: frozen deliverable changed during scoring ({label}): {json.dumps(changed)}")
 
@@ -142,6 +178,12 @@ def load_suites(path):
         resolved.append(entry)
     if len({s["tree"] for s in resolved}) != len(resolved):
         raise SystemExit("suites: every suite needs its own tree")
+    for entry, suite in zip(resolved, suites):
+        if entry["deliverable"] is not None:
+            # Binds the working copy to the sealed baseline archive and the hash recorded at freeze.
+            if not (suite.get("archive") and suite.get("archive_sha256")):
+                raise SystemExit(f"suites: {entry['name']}: a deliverable needs its archive and archive_sha256")
+            entry.update(archive=(path.parent / suite["archive"]).resolve(), archive_sha256=suite["archive_sha256"])
     return resolved
 
 
@@ -360,7 +402,7 @@ def check_current(args):
         runs.append(run_suites(suites, set(args.scope)))
         require_frozen(suites, frozen, f"check run {number + 1}")
     print(json.dumps({"diff_sha256": digest(diff), "runs": runs,
-                      "deliverables": {name: digest(json.dumps(files, sort_keys=True)) for name, files in frozen.items()}},
+                      "deliverables": {s["name"]: s["archive_sha256"] for s in suites if s["deliverable"] is not None}},
                      indent=2))
 
 
@@ -499,11 +541,13 @@ def reproduce(args):
     tree = work / f"replay-{suite['name']}" / "repo"
     subprocess.run(["git", "clone", "-q", str(Path(args.repo).resolve()), str(tree)], check=True, capture_output=True)
     deliverable = Path(args.deliverable).resolve()
-    source = fingerprint(deliverable)
+    source = snapshot([suite])[suite["name"]]
+    if fingerprint(deliverable) != source:
+        raise SystemExit("S5: the deliverable to replay differs from the sealed archive")
     shutil.copytree(deliverable, tree / deliverable.name)
     copy = tree / deliverable.name
     if fingerprint(copy) != source:
-        raise SystemExit("S5: the replay copy of the deliverable differs from the frozen deliverable")
+        raise SystemExit("S5: the replay copy of the deliverable differs from the sealed archive")
     python = str(Path(args.python).absolute())
     # Works in environments built without pip (for example by uv).
     freeze = subprocess.run([python, "-c", "import importlib.metadata as m; print('\\n'.join(sorted("

@@ -156,7 +156,9 @@ class Evidence:
                                    "verdict": "supported" if n < supported else "unsupported"} for n in range(sampled)]
         survived = {"class": "survived"}
         self.write("clean.json", {"runs": [{s: ({"class": "behavioral"} if s in self.clean_fail else survived)
-                                            for s in (*compare.LABELS, compare.UPSTREAM)} for _ in range(3)]})
+                                            for s in (*compare.LABELS, compare.UPSTREAM)} for _ in range(3)],
+                                  "deliverables": {label: hashlib.sha256(label.encode()).hexdigest()
+                                                   for label in compare.LABELS}})
         ids = [f"m{i:03d}" for i in range(self.n_mutants)]
         self.write("mutants.json", {"selected": [{"id": i} for i in ids]})
         kills = lambda label, i: i < (self.upstream_k if label == compare.UPSTREAM else self.k[label]) \
@@ -317,6 +319,17 @@ class Measures(EvidenceCase):
         evidence.build()
         (evidence.root / "baseline-W.tar").write_bytes(b"changed")
         self.assertFalse(compare.compare(evidence.root)["validity"]["V1"])
+
+    def test_scored_archives_must_be_the_frozen_ones(self):
+        evidence = self.evidence()
+        evidence.build()
+        clean = json.loads((evidence.root / "clean.json").read_text())
+        clean["deliverables"]["X"] = "0" * 64  # scored against some other archive
+        (evidence.root / "clean.json").write_text(json.dumps(clean))
+        result = compare.compare(evidence.root)
+        self.assertFalse(result["validity"]["V1"])
+        self.assertFalse(result["validity"]["details"]["scored_archives_match_freeze"]["X"])
+        self.assertEqual(result["decision"], "INCONCLUSIVE")
 
     def test_labels_must_map_two_runs_per_condition(self):
         evidence = self.evidence()
