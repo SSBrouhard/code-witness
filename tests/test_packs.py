@@ -31,7 +31,7 @@ class PackTests(unittest.TestCase):
     def test_portable_pack_and_relocated_sources(self):
         repo = self.checkout()
         pack = self.root / "original-pack"
-        # Record the actual invocation directory even when it isn't the repo root.
+        # Defaults locate the source root even when invoked from a subdirectory.
         previous = Path.cwd()
         try:
             os.chdir(repo / "sample")
@@ -40,8 +40,8 @@ class PackTests(unittest.TestCase):
             os.chdir(previous)
         manifest = json.loads((pack / "manifest.json").read_text())
         self.assertEqual(manifest["source_files"], ["sample/legacy/batch.py"])
-        self.assertEqual(manifest["source_roots"][0]["path"], "..")
-        self.assertEqual((pack / manifest["default_source_root"]).resolve(), repo / "sample")
+        self.assertEqual(manifest["source_roots"][0]["path"], ".")
+        self.assertEqual((pack / manifest["default_source_root"]).resolve(), repo)
         self.assertEqual(manifest["exit_classification"], "match")
         self.assertIsNone(manifest["source_roots"][0]["git_head"])
         for name in ("graph.md", "annotations.json", "invariants.json", "manifest.json", "dual_run.md", "risk.md", "tests/observations.json", "tests/test_characterization.py"):
@@ -121,6 +121,8 @@ class PackTests(unittest.TestCase):
         pack = self.root / "pack"
         extract(ROOT / "sample/legacy", pack)
         original_risk = (pack / "risk.md").read_text()
+        original_evidence = {str(p.relative_to(pack)): p.read_bytes()
+                             for p in pack.rglob("*") if p.is_file()}
         calls = []
 
         class Response:
@@ -155,6 +157,8 @@ class PackTests(unittest.TestCase):
         self.assertEqual(result["claims"][1]["review"]["verdict"], "not-returned")
         self.assertIn("advisory", result["limitations"][0])
         self.assertEqual((pack / "risk.md").read_text(), original_risk)
+        self.assertEqual({str(p.relative_to(pack)): p.read_bytes()
+                          for p in pack.rglob("*") if p.is_file()}, original_evidence)
         self.assertEqual(calls[0][1], 3)
         payload = json.loads(calls[0][0].data)
         self.assertEqual(payload["model"], "jev-latest")
