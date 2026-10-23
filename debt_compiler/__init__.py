@@ -1,7 +1,7 @@
 """Deterministic extraction. No model or network calls."""
 
 
-def extract(paths, out="debt-pack"):
+def extract(paths, out="debt-pack", *, require_runtime=False):
     """Write a contract pack for a path or iterable of paths; return its summary."""
     from .cli import extract as extract_pack
-    return extract_pack(paths, out)
+    return extract_pack(paths, out, require_runtime=require_runtime)

@@ -16,6 +16,11 @@ debt-compiler extract sample/legacy --out /tmp/debt-pack
 python -m unittest discover -s /tmp/debt-pack/tests -v
 ```
 
+To require behavioral verification, use `debt-compiler extract sample/legacy
+--out /tmp/debt-pack --require-runtime`. The JSON summary and manifest expose
+`verification.status`, its reason and case counts, plus `exit_code`. The library
+accepts the same requirement as `extract(paths, out, require_runtime=True)`.
+
 For an isolated install, first run `python3 -m venv .venv` and `source .venv/bin/activate`.
 
 Run the development checks:
@@ -23,6 +28,8 @@ Run the development checks:
 ```sh
 python -m unittest discover -s tests -v
 ```
+
+GitHub Actions runs this suite on Python 3.10 and 3.14 using Linux runners.
 
 A directory or explicit Python file set works:
 
@@ -55,11 +62,29 @@ It writes `/tmp/debt-pack/jev_review.json` by default. This is an advisory exter
 - `tests/test_characterization.py` and `tests/observations.json`: captured legacy observations and runnable regression assertions against both implementations. Source paths are relative to the recorded repository/source root. Replay from any working directory, or relocate the checkout with `--source-root` as described below. Tests compare against the stored legacy baseline, not regenerated expectations.
 - `dual_run.md`: actual observations and legacy/modern comparison, including exceptions, stdout/stderr, and sleep requests.
 - `risk.md`: touch / do-not-touch / needs-human.
-- `manifest.json`: format/tool versions, extraction time, selected relative source files, source-root locations, Git HEAD (null for an unborn/non-Git repository), and exit classification/code. This version produces a single-root pack; mixed-repository slices are rejected.
+- `manifest.json`: format/tool versions, extraction time, relative source locators, Git HEAD and dirty state, SHA-256 source/fixture fingerprints, interpreter and extractor identity, verification outcome and exit classification/code. This version produces a single-root pack; mixed-repository slices are rejected.
 
 ## Runtime convention and limits
 
-Static extraction works for any selected Python files. Runtime characterization requires a selected `batch.py`, a sibling `../fixtures/cases.json`, and a callable `run(case, sleep=...)`. Fixtures are a nonempty JSON list of unique `{"name": "case-name", "input": {...}}` objects. A sibling `../modern/batch.py` is optional. Without fixtures or a recognizable top-level synchronous `run(case, sleep=...)`, extraction still writes every static artifact, dual-run says NOT RUN, generated characterization skips with NOT RUN, and the manifest records `runtime-skipped` with exit 0. Missing conventions are detected without importing the target. Multiple runnable slices must be extracted separately.
+Static extraction works for any selected Python files. Runtime characterization requires a selected `batch.py`, a sibling `../fixtures/cases.json`, and a callable `run(case, sleep=...)`. Fixtures are a nonempty JSON list of unique `{"name": "case-name", "input": {...}}` objects. A sibling `../modern/batch.py` is optional. Without fixtures or a recognizable top-level synchronous `run(case, sleep=...)`, extraction still writes every static artifact, dual-run says NOT RUN, generated characterization skips with NOT RUN, and verification is INCONCLUSIVE with exit 0 by default. Missing conventions are detected without importing the target. Multiple runnable slices must be extracted separately.
+
+Extraction success and verification are separate:
+
+| Verification | Meaning | Default exit | With `--require-runtime` |
+| --- | --- | --- | --- |
+| `PASS` | All supplied legacy/modern fixture comparisons pass; each detected invariant has passing applicable evidence for both targets | 0 | 0 |
+| `FAIL` | Observed mismatch or failed candidate check | 1 | 1 |
+| `BLOCKED` | Harness execution failed, source/fixture contents changed during extraction, or required runtime targets/fixtures are absent | 2 | 2 |
+| `INCONCLUSIVE` | Static-only or legacy-only evidence, incomplete coverage, or a candidate lacks applicable fixtures | 0 | 2 |
+
+Requiring runtime promotes missing conventions or a missing modern target to
+BLOCKED. Static-only extraction remains useful and successful without that flag;
+it never reports verification PASS. Generated tests explicitly skip missing
+coverage. They inherit an extraction's runtime requirement, and their standalone
+script also accepts `--require-runtime`. Harness failures preserve the static
+artifacts and completed observations with a BLOCKED result, unless a completed
+case already demonstrated a mismatch (FAIL). PASS is fixture-scoped evidence,
+not equivalence proof.
 
 **Only extract trusted code when this runtime convention is present.** The harness imports and executes the selected module automatically. A subprocess and five-second timeout isolate interpreter state; they are not a security sandbox. Each case gets a fresh process. Sleep injection records durations instead of waiting. Real timing, external services, arbitrary filesystem/network side effects, and process descendants are not verified. Direct sleeps outside the injection seam can time out.
 
@@ -67,18 +92,29 @@ The sample intentionally retains `sleep(50)`, retries, a bare except, manual cen
 
 Machine checks cover normal returns only: nonnegative balance given a nonnegative initial balance and disabled overdraft; half-up applied amounts; event index order; and negative-amount rejection. Error returns and raised exceptions are characterized but excluded from invariant checks. Passing fixtures is not a universal proof. Git subjects are historical evidence, not authoritative explanations.
 
-Exit codes: `0` pack written with no observed mismatch (may include explicit NOT RUN), `1` pack written with an output mismatch or failed invariant, `2` invalid input, parse failure, or harness failure. Existing named pack artifacts are overwritten on re-extraction; use a new output directory to retain a baseline. Source files are not edited.
+Exit codes: `0` successful extraction with no observed failure and no unmet runtime requirement, `1` demonstrated mismatch or failed invariant, `2` invalid input, parse failure, blocked execution, or insufficient required verification. Invalid inputs can fail before a pack is written. Existing named pack artifacts are overwritten on re-extraction; use a new output directory to retain a baseline. Source files are not edited.
 
 ## Portable replay and pack diff
 
-All compiler-generated source locators are relative. `manifest.json` records the
-invocation directory as `default_source_root`, relative to the pack directory;
-`source_roots[0].path` locates the repository root relative to that invocation
-directory. Together they preserve the original default without a machine-absolute
-path. In a non-Git slice, the root is the invocation directory when it contains
+All compiler-generated source locators are relative. Format v2 records the
+repository/source root as `default_source_root`, relative to the pack directory,
+with `source_roots[0].path` set to `.`. In a non-Git slice, the root is the invocation directory when it contains
 all selected files, otherwise their common parent. The default works as long as
 that relative layout remains intact. Application-returned strings are preserved
 verbatim in observations, even if the application prints its own absolute paths.
+
+SHA-256 fingerprints cover selected Python files, the discovered modern target,
+and fixture JSON bytes. Git HEAD alone is not content identity: `git_dirty`
+records working-tree changes (null without Git), and hashes identify captured
+contents even with an unborn HEAD or uncommitted changes. Fingerprints are
+checked again after execution; a changed or missing input blocks verification.
+The environment records Python version/implementation/cache tag, OS/architecture,
+parser dependency versions, and a digest of the extractor's Python source.
+No interpreter executable path is stored. This is bounded provenance, not an
+attestation or complete environment lock: imported target dependencies, external
+resources, and transient changes between reads are not fingerprinted or isolated.
+The runtime target is compiled from current source bytes to avoid stale `.pyc`
+observations; imported helpers retain normal Python import behavior.
 
 To move a pack and its source independently, provide the new **repository/source
 root**, not the legacy module directory (unless that was the non-Git source root):
@@ -99,15 +135,18 @@ debt-compiler diff /tmp/debt-old /tmp/debt-new
 ```
 
 Diff compares annotation identities (`file:line + tag`) and their snippet/reason/
-risk, invariant candidates and fixture checks, dual-run case names and
-MATCH/MISMATCH/LEGACY ONLY/NOT RUN verdicts, and the contents of the three risk
-buckets. It ignores manifest timestamps, source-location defaults (including
-absolute defaults), and Git provenance. Reordered JSON keys/list evidence do not
-count as changes. Exit 0 means identical-enough; exit 1 means any of these
-contract categories changed; exit 2 means a missing/invalid/unsupported pack.
-This is a contract diff, not a general output or code diff: changed return values
-that still MATCH each other and leave the compared contracts unchanged are not
-reported. Packs from the earlier format without a manifest must be re-extracted.
+risk, invariant candidates and fixture checks, runtime coverage, case names,
+fixture inputs, legacy and modern observations (returns, exception type/message,
+stdout, stderr, requested sleeps), verdicts, and the three risk buckets. A change
+is detected even when both targets still MATCH. It ignores extraction timestamps,
+source-location defaults, environment and provenance metadata. Reordered JSON
+keys, cases and invariant evidence do not count as changes; ordered application
+results and sleep sequences retain their order. Exit 0 means identical-enough;
+exit 1 means contract or captured behavior changed; exit 2 means a
+missing/invalid/unsupported pack. Provenance-only changes do not imply behavioral
+changes. Formats 1 and 2 can be compared and replayed; v1 lacks the new provenance
+and verification guarantees. Unknown versions are rejected by diff. Packs without
+a manifest must be re-extracted.
 
 The non-sample result is in `packs/foreign-1`; see its `REAL_TARGET.md` for the
 actual tags, NOT RUN status, and missed semantics. The unmodified MIT source and
