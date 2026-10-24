@@ -82,6 +82,14 @@ class PairedKnockout(unittest.TestCase):
                            extras={"score.py": "VALUE = 7\n"})
         self.check_pair(suites, "pass", "changed", reached=1)
 
+    def test_pytest_probe_does_not_require_the_witness_engine(self):
+        suites = self.pair("def value():\n    return 7\n", "    return core.value()\n",
+                           "from canary import core\n\ndef test_calls_target():\n    assert core.value() == 7\n",
+                           extras={"debt_compiler.py": "raise RuntimeError('pytest must not import the witness engine')\n"})
+        result = self.knockout(suites, "pytest")
+        self.assertEqual(result["status"], "pass")
+        self.assertEqual(result["reached_target"], 1)
+
     def test_import_only_without_initialization_has_no_execution_credit(self):
         suites = self.pair("def value():\n    return 7\n", "    return 7\n",
                            "from canary import core\n\ndef test_import_only():\n    assert core is not None\n")

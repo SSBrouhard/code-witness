@@ -4,8 +4,6 @@ from pathlib import Path
 import sys
 import traceback
 
-from debt_compiler.harness import worker
-
 
 class KnockoutTrace:
     """Scoped knockout exception evidence, with imports kept separate from item execution."""
@@ -42,6 +40,9 @@ class KnockoutTrace:
 
 
 def probe(adapter, case, scope):
+    # pytest uses only KnockoutTrace and need not have the witness engine installed.
+    from debt_compiler.harness import worker
+
     trace = KnockoutTrace(scope, adapter)
     # Only G2 is instrumented. The engine's import and observation behavior is unchanged.
     sys.settrace(trace.trace)
