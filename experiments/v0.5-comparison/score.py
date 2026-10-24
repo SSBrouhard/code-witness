@@ -233,7 +233,7 @@ def collection_origin(text, scope):
     return ("target" if Path(origin["path"]).as_posix() in scope else "outside"), location
 
 
-def junit_cases(root, scope):
+def junit_cases(root, scope, knockout_details=False):
     """Every test item in a pytest junit report: passed, skipped, or its failure class. A collection error
     keeps the class "collection" here; classify_collection applies amendment B2 with the suite's evidence."""
     cases = {}
@@ -252,6 +252,9 @@ def junit_cases(root, scope):
             cases[name] = {"class": "setup"}
         else:
             cases[name] = {"class": "skipped" if case.find("skipped") is not None else "passed"}
+        if knockout_details:
+            nodeid = case.find("properties/property[@name='cw_b3_nodeid']")
+            cases[name]["nodeid"] = nodeid.get("value") if nodeid is not None else None
     return cases
 
 
@@ -299,7 +302,7 @@ def classify_collection(cases, clean, rerun):
     return cases
 
 
-def run_pytest(suite, scope, argv=None, env=None, cwd=None):
+def run_pytest(suite, scope, argv=None, env=None, cwd=None, knockout_details=False):
     """Run a pytest suite with junit output. Returns (exit code or None on timeout, cases, output tail)."""
     with tempfile.TemporaryDirectory() as tmp:
         report = Path(tmp, "junit.xml")
@@ -309,7 +312,7 @@ def run_pytest(suite, scope, argv=None, env=None, cwd=None):
                                   capture_output=True, text=True, timeout=suite["timeout"])
         except subprocess.TimeoutExpired:
             return None, {}, ""
-        cases = junit_cases(ET.parse(report).getroot(), scope) if report.is_file() else {}
+        cases = junit_cases(ET.parse(report).getroot(), scope, knockout_details) if report.is_file() else {}
         return done.returncode, cases, (done.stdout + done.stderr)[-500:]
 
 
@@ -583,6 +586,166 @@ def witness_knockout_cases(suite):
     return [row["name"] for row in data["rows"]], cases, reached
 
 
+def b3_witness_probe(suite, adapter, case, scope):
+    """A G2-only worker envelope; never infer attribution from a truncated stderr string."""
+    purge_bytecode(suite["tree"])
+    request = {"adapter": str(adapter), "input": case,
+               "scope": [str(suite["tree"] / name) for name in scope]}
+    try:
+        done = subprocess.run([sys.executable, str(Path(__file__).with_name("cw_b3_probe.py"))],
+                              input=json.dumps(request), cwd=suite["tree"], capture_output=True,
+                              text=True, timeout=5)
+    except subprocess.TimeoutExpired:
+        return {"phase": "timeout"}
+    if done.returncode:
+        return {"phase": "error", "reason": "worker exited", "exit": done.returncode}
+    try:
+        result = json.loads(done.stdout)
+    except json.JSONDecodeError:
+        return {"phase": "error", "reason": "worker did not return JSON"}
+    return result if isinstance(result, dict) else {"phase": "error", "reason": "invalid worker result"}
+
+
+def b3_pytest_run(suite, scope):
+    """Phase tracing is confined to this supplemental probe; ordinary pytest scoring is unchanged."""
+    with tempfile.TemporaryDirectory() as tmp:
+        events = Path(tmp, "events.json")
+        # Do not add the scoring directory to target imports (it also contains score.py, etc.).
+        for name in ("cw_b3_trace.py", "cw_b3_probe.py"):
+            shutil.copyfile(Path(__file__).with_name(name), Path(tmp, name))
+        env = {"CW_B3_EVENTS": str(events), "CW_B3_SCOPE": json.dumps([str(suite["tree"] / s) for s in scope]),
+               "PYTHONPATH": os.pathsep.join(p for p in (tmp, suite["env"].get("PYTHONPATH",
+                                                        os.environ.get("PYTHONPATH", ""))) if p)}
+        argv = [*suite["argv"][:3], "-p", "cw_b3_trace", *suite["argv"][3:]]
+        code, cases, tail = run_pytest(suite, scope, argv=argv, env=env, knockout_details=True)
+        recorded = json.loads(events.read_text()) if events.is_file() else None
+        return code, cases, tail, recorded
+
+
+def b3_pytest_cases(clean_cases, knocked, timed_out, events):
+    """Collection attribution is dependency evidence, never an executed item's changed outcome."""
+    units = sorted(name for name, case in clean_cases.items() if case["class"] == "passed")
+    cases = {"changed": [], "unchanged": [], "blocked": [], "errored": []}
+    dependencies, reached, evidence = [], [], []
+    collection = {c["module"]: c for c in knocked.values() if c.get("module")}
+    for name in units:
+        classname = name.split("::", 1)[0]
+        module = next((m for m in collection if classname == m or classname.startswith(m + ".")), None)
+        case = knocked.get(name)
+        dependency = collection.get(module, {})
+        item_events = [e for e in (events or []) if case and e["unit"] == case.get("nodeid")]
+        runtime = [e for e in item_events if e["phase"] in ("setup", "item", "teardown") and not e["import_dependency"]]
+        pre_item = [e for e in item_events if e["phase"] == "collection" or e["import_dependency"]]
+        dependencies.extend({**e, "unit": name} for e in pre_item)
+        if runtime:
+            reached.append(name)
+            evidence.extend({**e, "unit": name} for e in runtime)
+        if timed_out:
+            kind = "blocked"
+        elif events is None:
+            kind = "errored"
+        elif case is None and dependency.get("class") == "collection-target" and dependency.get("knockout") \
+                and dependency.get("location", "").endswith(": CodeWitnessKnockout"):
+            kind = "blocked"
+            dependencies.append({"unit": name, "phase": "collection", "location": dependency["location"]})
+        elif case and case["class"] == "passed":
+            kind = "unchanged"
+        elif runtime and case["class"] in ("assertion", "target-exception", "setup"):
+            kind = "changed"
+        elif pre_item:
+            kind = "blocked"
+        else:
+            kind = "errored"
+        cases[kind].append(name)
+    return units, cases, reached, dependencies, evidence
+
+
+def knockout_b3(args):
+    """Supplemental B3: only a per-item runtime knockout response receives changed credit.
+
+    Pre-item target knockouts are separately attributed dependencies and remain blocked in the
+    original denominator. Unattributed changes/failures are errors, not evidence of target execution.
+    """
+    (suite,) = [s for s in load_suites(args.suites) if s["name"] == args.suite]
+    tree, scope = suite["tree"], set(args.scope)
+    require_clean(tree)
+    frozen = snapshot([suite])
+    if suite["kind"] == "witness":
+        data = json.loads((suite["pack"] / "tests/observations.json").read_text())
+        root = resolve_source_root(suite["pack"], json.loads((suite["pack"] / "manifest.json").read_text()))
+        adapter = root / data["legacy"]
+        for row in data["rows"]:
+            clean = b3_witness_probe(suite, adapter, row["input"], scope)
+            if clean.get("phase") != "item" or observation_json(clean["observation"]) != observation_json(row["legacy"]):
+                raise SystemExit("B3: clean witness replay must match the frozen observations")
+    else:
+        purge_bytecode(tree)
+        code, clean_cases, _, clean_events = b3_pytest_run(suite, scope)
+        if code != 0 or clean_events is None or not clean_cases or any(
+                c["class"] not in ("passed", "skipped") for c in clean_cases.values()):
+            raise SystemExit("B3: clean pytest replay must pass before knockout")
+        clean = collected_modules(suite)
+    require_clean(tree)
+    require_frozen([suite], frozen, "B3 clean replay")
+    try:
+        for name in args.scope:
+            path = tree / name
+            path.write_text(ast.unparse(ast.fix_missing_locations(Knockout().visit(ast.parse(path.read_text())))) + "\n")
+        if suite["kind"] == "pytest":
+            purge_bytecode(tree)
+            code, knocked, _, events = b3_pytest_run(suite, scope)
+            classify_collection(knocked, clean, lambda: b3_pytest_run(suite, scope)[1])
+            units, cases, reached, dependencies, evidence = b3_pytest_cases(clean_cases, knocked, code is None, events)
+        else:
+            units = [row["name"] for row in data["rows"]]
+            cases = {"changed": [], "unchanged": [], "blocked": [], "errored": []}
+            reached, dependencies, evidence = [], [], []
+            for row in data["rows"]:
+                result = b3_witness_probe(suite, adapter, row["input"], scope)
+                if result.get("target_knockout"):
+                    again = b3_witness_probe(suite, adapter, row["input"], scope)
+                    if again == result:
+                        kind = "blocked"
+                        dependencies.append({"unit": row["name"], "phase": "adapter-import",
+                                             "location": f"{Path(result['path']).relative_to(tree)}:{result['line']}: {result['type']}"})
+                    else:
+                        kind = "errored"
+                elif result.get("phase") == "timeout":
+                    kind = "blocked"
+                elif result.get("phase") != "item":
+                    kind = "errored"
+                else:
+                    observed = result["observation"]
+                    runtime = [e for e in result["events"] if e["phase"] == "item" and not e["import_dependency"]]
+                    pre_item = [e for e in result["events"] if e["phase"] != "item" or e["import_dependency"]]
+                    dependencies.extend({**e, "unit": row["name"]} for e in pre_item)
+                    if runtime:
+                        reached.append(row["name"])
+                        evidence.extend({**e, "unit": row["name"]} for e in runtime)
+                    if observation_json(observed) == observation_json(row["legacy"]):
+                        kind = "unchanged"
+                    elif runtime:
+                        kind = "changed"
+                    elif pre_item:
+                        kind = "blocked"
+                    else:
+                        kind = "errored"
+                cases[kind].append(row["name"])
+    finally:
+        restore(tree)
+    require_frozen([suite], frozen, "B3 knockout")
+    for entry in [*evidence, *dependencies]:
+        if "path" in entry:
+            entry["path"] = Path(entry["path"]).relative_to(tree).as_posix()
+    counts = {kind: len(names) for kind, names in cases.items()}
+    print(json.dumps({"methodology": "B3-supplemental-post-hoc", "suite": suite["name"], "kind": suite["kind"],
+                      "units": len(units), "counts": counts, "reached_target": len(reached),
+                      "runtime_evidence": evidence, "dependency_evidence": dependencies,
+                      "threshold": KNOCKOUT_THRESHOLD,
+                      "status": knockout_status(len(units), counts["changed"], counts["blocked"], counts["errored"]),
+                      "cases": cases}, indent=2))
+
+
 def knockout(args):
     """Adapter honesty: replace every target-scope function body with a raise, in one suite's tree.
 
@@ -590,6 +753,8 @@ def knockout(args):
     changed: the unit observed the knockout (reached_target: it carries the knockout marker).
     unchanged: the unit never reached target-scope functions. blocked: timed out. errored: could not run.
     """
+    if args.methodology == "b3":
+        return knockout_b3(args)
     (suite,) = [s for s in load_suites(args.suites) if s["name"] == args.suite]
     tree, scope = suite["tree"], set(args.scope)
     require_clean(tree)
@@ -749,6 +914,9 @@ def main(argv=None):
             command.add_argument("--data-file", required=True)
             command.add_argument("--include", nargs="+", required=True, help="Coverage include globs")
             command.add_argument("--timeout", type=float, default=600)
+        if name == "knockout":
+            command.add_argument("--methodology", choices=("original", "b3"), default="original",
+                                 help="B3 is supplemental/post hoc; original preserves the stopped attempt's method")
     args = parser.parse_args(argv)
     {"mutants": enumerate_mutants, "run": run_mutants, "check": check_current, "challenges": run_challenges,
      "knockout": knockout, "reproduce": reproduce, "coverage": measure_coverage}[args.command](args)
